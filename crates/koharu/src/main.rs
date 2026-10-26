@@ -3,6 +3,8 @@
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod mallinfo;
 
+use std::path::PathBuf;
+
 use clap::Parser as _;
 use koharu::panic;
 use koharu::sentry;
@@ -11,7 +13,14 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 #[derive(clap::Parser)]
 #[command(version, about)]
-struct Cli {}
+struct Cli {
+    /// Folder whose subfolders are translated as separate projects on startup.
+    #[arg(long, requires = "batch_destination")]
+    batch_source: Option<PathBuf>,
+    /// Folder that receives one exported folder per batch project.
+    #[arg(long, requires = "batch_source")]
+    batch_destination: Option<PathBuf>,
+}
 
 #[tokio::main]
 #[tauri_runtime_cef::cef_entry_point]
@@ -26,7 +35,7 @@ async fn main() {
         };
     }
 
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
     let _guard = sentry::initialize();
     panic::install();
     tracing::subscriber::set_global_default(
@@ -40,6 +49,13 @@ async fn main() {
             .with(koharu::tracing::TimingLayer::new()),
     )
     .expect("failed to set the global tracing subscriber");
-    tokio::task::block_in_place(|| app::run(tauri::generate_context!()))
+    let batch = cli
+        .batch_source
+        .zip(cli.batch_destination)
+        .map(|(source, destination)| app::Batch {
+            source,
+            destination,
+        });
+    tokio::task::block_in_place(|| app::run(tauri::generate_context!(), batch))
         .expect("failed to run the desktop application");
 }

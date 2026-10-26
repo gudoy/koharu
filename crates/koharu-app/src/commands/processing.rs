@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::{AppHandle, Manager as _, State, ipc::Channel};
 use tauri_runtime_cef::CefRuntime;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::{ChannelExt as _, Error, canvas::CanvasChannel, project::CurrentProject};
@@ -73,15 +74,25 @@ pub(crate) struct JobChannel {
 
 #[tauri::command]
 #[specta::specta]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process(
     handle: AppHandle<CefRuntime>,
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
-    project: State<'_, CurrentProject>,
-    processing: State<'_, Processing>,
-    job_channel: State<'_, JobChannel>,
 ) -> std::result::Result<JobId, Error> {
+    let (id, _) = start(&handle, scope, operation).await?;
+    Ok(id)
+}
+
+/// Starts a pipeline job. The returned task resolves to the job's terminal
+/// state once the run has published its final update.
+pub(crate) async fn start(
+    handle: &AppHandle<CefRuntime>,
+    scope: koharu_pipeline::Scope,
+    operation: koharu_pipeline::Operation,
+) -> Result<(JobId, JoinHandle<(JobState, Option<String>)>)> {
+    let project = handle.state::<CurrentProject>();
+    let processing = handle.state::<Processing>();
+    let job_channel = handle.state::<JobChannel>();
     let snapshot = project
         .project
         .lock()
@@ -94,7 +105,7 @@ pub(crate) async fn process(
     {
         let mut stops = processing.stops.lock();
         if !stops.is_empty() {
-            return Err(anyhow::anyhow!("another process is already running").into());
+            anyhow::bail!("another process is already running");
         }
         stops.insert(id, stop.clone());
     }
@@ -114,7 +125,7 @@ pub(crate) async fn process(
     let pipeline = handle.state::<koharu_pipeline::Pipeline>().inner().clone();
     let task_handle = handle.clone();
     let inpainting_mask = processing.inpainting_mask.lock().take();
-    drop(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let progress = Arc::new(Mutex::new((0_usize, 0_usize)));
         let progress_handle = task_handle.clone();
         let mut request = koharu_pipeline::Request {
@@ -207,27 +218,29 @@ pub(crate) async fn process(
             }
         };
         task_handle.state::<Processing>().stops.lock().remove(&id);
+        let state = if stopped {
+            JobState::Stopped
+        } else if error.is_some() {
+            JobState::Failed
+        } else {
+            JobState::Finished
+        };
         let job = task_handle
             .state::<Processing>()
             .jobs
             .lock()
             .remove(&id)
             .map(|mut job| {
-                job.state = if stopped {
-                    JobState::Stopped
-                } else if error.is_some() {
-                    JobState::Failed
-                } else {
-                    JobState::Finished
-                };
-                job.error = error;
+                job.state = state;
+                job.error.clone_from(&error);
                 job
             });
         if let Some(job) = job {
             task_handle.state::<JobChannel>().channel.publish(job);
         }
-    }));
-    Ok(id)
+        (state, error)
+    });
+    Ok((id, task))
 }
 
 #[tauri::command]

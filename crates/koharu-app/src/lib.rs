@@ -4,4 +4,4 @@ mod app;
 mod commands;
 
 pub use app::run;
-pub use commands::bindings;
+pub use commands::{batch::Batch, bindings};

@@ -236,6 +236,11 @@ impl ProjectLibrary {
         Project::open(name, path).await
     }
 
+    pub(crate) fn exists(&self, name: &str) -> Result<bool> {
+        let (_, path) = self.resolve(name)?;
+        Ok(path.is_dir())
+    }
+
     pub(crate) fn delete(&self, name: &str) -> Result<()> {
         let (_, path) = self.resolve(name)?;
         if !path.is_dir() {
