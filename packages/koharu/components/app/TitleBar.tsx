@@ -57,6 +57,7 @@ export function TitleBar() {
     commands.export,
     'menu.export',
   )
+  const { run: runBatch, busy: batching } = useCommand(['batch'], commands.batch, 'menu.batch')
 
   const run = (scope: Scope, operation: Operation = { operation: 'full' }) =>
     void call(commands.process, scope, operation).catch(() => undefined)
@@ -129,6 +130,10 @@ export function TitleBar() {
                   ))}
                 </MenubarSubContent>
               </MenubarSub>
+              <MenubarItem disabled={batching} aria-busy={batching} onClick={() => runBatch()}>
+                {batching && <LoaderCircle className='animate-spin' aria-hidden='true' />}
+                {t('menu.batch')}
+              </MenubarItem>
               <MenubarSeparator />
               <MenubarItem disabled={!project} onClick={closeProject}>
                 {t('menu.closeProject')}

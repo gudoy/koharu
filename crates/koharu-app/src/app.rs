@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::commands::{
     agent::AgentState,
+    batch::Batch,
     canvas::CanvasChannel,
     lifecycle::{
         Download, DownloadChannel, DownloadState, Initialization, ModelResources, ProjectChannel,
@@ -53,7 +54,8 @@ pub(crate) async fn initialize(handle: AppHandle<CefRuntime>) -> Result<()> {
     Ok(())
 }
 
-pub fn run(context: tauri::Context<CefRuntime>) -> Result<()> {
+/// Runs the desktop app. A `batch` starts once the runtime is initialized.
+pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<()> {
     let cef = Cef::default();
     #[cfg(debug_assertions)]
     let cef = cef.remote_debugging(tauri_runtime_cef::RemoteDebugging::Port {
@@ -147,6 +149,16 @@ pub fn run(context: tauri::Context<CefRuntime>) -> Result<()> {
                     .await
                     .expect("failed to initialize the desktop runtime");
                 initialization_handle.state::<Initialization>().ready();
+                if let Some(batch) = batch
+                    && let Err(error) = crate::commands::batch::run(
+                        &initialization_handle,
+                        &batch.source,
+                        &batch.destination,
+                    )
+                    .await
+                {
+                    tracing::error!(error = format!("{error:#}"), "batch failed");
+                }
             }));
 
             let mut downloads = koharu_runtime::download::subscribe();

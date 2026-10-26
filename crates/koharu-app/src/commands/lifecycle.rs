@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context as _, Result};
 use koharu_desktop::{CanvasState, Desktop};
 use koharu_scene::{AssetInput, AssetMetadata, AssetRole, At, PageDraft};
@@ -180,7 +182,7 @@ pub(crate) async fn subscribe(
     })
 }
 
-async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Project) -> Result<()> {
+pub(crate) async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Project) -> Result<()> {
     let snapshot = opened.snapshot();
     let page = opened.active_page();
     let info = opened.info();
@@ -337,12 +339,9 @@ async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
 pub(crate) async fn import(
     source: PageImportSource,
     window: WebviewWindow<CefRuntime>,
-    desktop: State<'_, Desktop>,
-    project: State<'_, CurrentProject>,
-    processing: State<'_, Processing>,
-    canvas_channel: State<'_, CanvasChannel>,
+    handle: AppHandle<CefRuntime>,
 ) -> std::result::Result<(), Error> {
-    if !processing.stops.lock().is_empty() {
+    if !handle.state::<Processing>().stops.lock().is_empty() {
         return Err(anyhow::anyhow!("pages cannot be imported while processing is running").into());
     }
     let extensions = import::Format::iter()
@@ -358,35 +357,51 @@ pub(crate) async fn import(
                 .map(|file| file.path().to_owned())
                 .collect::<Vec<_>>()
         }),
-        PageImportSource::Folder => dialog.pick_folder().await.map(|folder| {
-            WalkDir::new(folder.path())
-                .follow_links(false)
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    Ok(entry) if entry.file_type().is_file() => Some(entry.into_path()),
-                    Ok(_) => None,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not inspect an import directory entry");
-                        None
-                    }
-                })
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.parse::<import::Format>().is_ok())
-                })
-                .collect::<Vec<_>>()
-        }),
+        PageImportSource::Folder => dialog
+            .pick_folder()
+            .await
+            .map(|folder| folder_files(folder.path())),
     };
     let Some(files) = files else {
         return Ok(());
     };
+    import_files(&handle, files).await?;
+    Ok(())
+}
+
+/// Lists the importable files below `folder`.
+pub(crate) fn folder_files(folder: &Path) -> Vec<PathBuf> {
+    WalkDir::new(folder)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_file() => Some(entry.into_path()),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect an import directory entry");
+                None
+            }
+        })
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.parse::<import::Format>().is_ok())
+        })
+        .collect()
+}
+
+/// Appends `files` as pages of the open project.
+pub(crate) async fn import_files(
+    handle: &AppHandle<CefRuntime>,
+    files: Vec<PathBuf>,
+) -> Result<()> {
     if files.is_empty() {
-        return Err(anyhow::anyhow!("no supported images were found in the selection").into());
+        anyhow::bail!("no supported images were found in the selection");
     }
     let pages = tokio_rayon::spawn(move || import::import(files)).await?;
 
     let (commit, page) = {
+        let project = handle.state::<CurrentProject>();
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
         let source = AssetRole::new("source")?;
@@ -422,9 +437,10 @@ pub(crate) async fn import(
         let page = project.active_page();
         (commit, page)
     };
+    let desktop = handle.state::<Desktop>();
     desktop.synchronize(&commit.snapshot, page, &commit).await?;
     let canvas = desktop.canvas_state();
-    canvas_channel.channel.publish(canvas);
+    handle.state::<CanvasChannel>().channel.publish(canvas);
     Ok(())
 }
 

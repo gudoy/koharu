@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "About",
+    "batch": "Batch Translate Folders…",
     "closeProject": "Close Project",
     "delete": "Delete Selected",
     "discord": "Discord",
