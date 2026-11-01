@@ -45,7 +45,7 @@ pub(super) struct Model {
 impl Model {
     pub fn new(device: Device) -> Self {
         let mut var_store = nn::VarStore::new(device);
-        crate::backend::set_precision(&mut var_store);
+        crate::backend::set_reduced_precision(&mut var_store);
         let root = var_store.root();
         // Joiner is nn.Sequential(backbone, position_embedding), hence the `0`.
         let backbone = Backbone::new(&(&root / "backbone" / 0));
@@ -85,7 +85,7 @@ impl Model {
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<()> {
         // The complete RF-DETR tree is registered before this strict VarStore load.
         self.var_store.load(path)?;
-        crate::backend::set_precision(&mut self.var_store);
+        crate::backend::set_reduced_precision(&mut self.var_store);
         Ok(())
     }
 
@@ -104,8 +104,11 @@ impl Model {
         );
 
         let hs = transformer_output.hs;
+        // Box decoding stays in FP32 even when the VarStore is BF16. Decoding in
+        // BF16 snaps every normalized coordinate to the BF16 grid, up to H/512
+        // per page-space edge, which upstream reference boxes do not show.
         let reference = transformer_output.references;
-        let delta = self.bbox_embed.forward(&hs);
+        let delta = self.bbox_embed.forward(&hs).to_kind(Kind::Float);
         let pred_boxes = Tensor::cat(
             &[
                 delta.i((.., .., .., 0..2)) * reference.i((.., .., .., 2..4))
@@ -592,7 +595,12 @@ impl Transformer {
         let selected_proposals = output_proposals.i(0).index_select(0, &topk).unsqueeze(0);
         // The encoder box MLP is token-pointwise. Latest upstream gathers ranked
         // tokens first instead of evaluating and discarding every unselected box.
-        let delta = encoder.bbox_embed.forward(&selected_memory);
+        // Proposals and reference boxes stay in FP32 for the final box decoding;
+        // only the decoder consumes them in the VarStore kind.
+        let delta = encoder
+            .bbox_embed
+            .forward(&selected_memory)
+            .to_kind(Kind::Float);
         let topk_boxes = Tensor::cat(
             &[
                 delta.i((.., .., 0..2)) * selected_proposals.i((.., .., 2..4))
@@ -602,7 +610,7 @@ impl Transformer {
             -1,
         );
 
-        let learned_refpoints = refpoint_embed.unsqueeze(0);
+        let learned_refpoints = refpoint_embed.unsqueeze(0).to_kind(Kind::Float);
         let references = Tensor::cat(
             &[
                 learned_refpoints.i((.., .., 0..2)) * topk_boxes.i((.., .., 2..4))
@@ -612,9 +620,13 @@ impl Transformer {
             -1,
         );
         let target = query_feat.unsqueeze(0);
-        let hs = self
-            .decoder
-            .forward(&target, &memory, &position, &references, (height, width));
+        let hs = self.decoder.forward(
+            &target,
+            &memory,
+            &position,
+            &references.to_kind(memory.kind()),
+            (height, width),
+        );
         TransformerOutput {
             hs,
             references: references.unsqueeze(0),
@@ -916,15 +928,16 @@ impl MultiscaleDeformableAttention {
     }
 }
 
+/// Upstream builds the proposal grid in FP32 and casts it to the memory dtype.
+/// The proposals stay in FP32 here because they feed the FP32 box decoding.
 fn generate_encoder_output_proposals(memory: &Tensor, height: i64, width: i64) -> (Tensor, Tensor) {
-    let options = (memory.kind(), memory.device());
+    let options = (Kind::Float, memory.device());
     let grid_y = Tensor::linspace(0.0, (height - 1) as f64, height, options);
     let grid_x = Tensor::linspace(0.0, (width - 1) as f64, width, options);
     let mesh = Tensor::meshgrid_indexing(&[grid_y, grid_x], "ij");
     let grid = Tensor::cat(&[mesh[1].unsqueeze(-1), mesh[0].unsqueeze(-1)], -1);
     let scale = Tensor::from_slice(&[width as f32, height as f32])
         .to_device(memory.device())
-        .to_kind(memory.kind())
         .view([1, 1, 2]);
     let grid = (grid.unsqueeze(0) + 0.5) / scale;
     let wh = Tensor::ones_like(&grid) * 0.05;

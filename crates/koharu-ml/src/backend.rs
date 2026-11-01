@@ -45,6 +45,19 @@ impl TryIntoDevice<koharu_torch::Device> for Device {
     }
 }
 
+/// Precision for the default detector and inpainter, which keep their
+/// results within comparison tolerance in bfloat16. Unlike [`set_precision`],
+/// it also uses bfloat16 on Apple GPUs, where it roughly halves their time.
+/// The bundled LibTorch MPS backend requires macOS 14, which has bfloat16
+/// kernels, so every usable MPS device takes this path.
+pub(crate) fn set_reduced_precision(var_store: &mut nn::VarStore) {
+    if matches!(var_store.device(), koharu_torch::Device::Mps) {
+        apply_precision(var_store, true);
+    } else {
+        set_precision(var_store);
+    }
+}
+
 pub(crate) fn set_precision(var_store: &mut nn::VarStore) {
     let hardware = Hardware::discover();
     let device_supports_bfloat16 = hardware
@@ -60,7 +73,10 @@ pub(crate) fn set_precision(var_store: &mut nn::VarStore) {
         });
     let use_bfloat16 =
         matches!(var_store.device(), koharu_torch::Device::Cuda(_)) && device_supports_bfloat16;
+    apply_precision(var_store, use_bfloat16);
+}
 
+fn apply_precision(var_store: &mut nn::VarStore, use_bfloat16: bool) {
     if var_store.is_empty() {
         var_store.set_kind(if use_bfloat16 {
             Kind::BFloat16
