@@ -7,7 +7,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use koharu_scene::{EntityId, LanguageTag, Snapshot};
+use koharu_scene::{
+    AssetRole, EntityId, LanguageTag, Origin, RasterLayer, RasterLayerKind, RecognizedFrom, Region,
+    RegionSpec as _, Snapshot, SourceText, TextRegion,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager as _, WebviewWindow};
 use tauri_runtime_cef::CefRuntime;
@@ -300,9 +303,76 @@ fn update(
     Ok(())
 }
 
-/// Pages a batch run sends through the pipeline.
-fn pending_pages(snapshot: &Snapshot, _target: &LanguageTag) -> Result<Vec<EntityId>> {
-    Ok(snapshot.pages().map(|page| page.id()).collect())
+/// Pages a batch run still sends through the pipeline. OCR and translation
+/// have no skip of their own, so a resumed run would otherwise redo every page
+/// that finished before the interruption.
+fn pending_pages(snapshot: &Snapshot, target: &LanguageTag) -> Result<Vec<EntityId>> {
+    let mut pending = Vec::new();
+    for page in snapshot.pages() {
+        if !finished(snapshot, page.id(), target)? {
+            pending.push(page.id());
+        }
+    }
+    Ok(pending)
+}
+
+/// A page is finished only when every stage left its output, read the way the
+/// stage itself reads the scene: a detected text region, source text on every
+/// content recognized from one, a translation in the target language for every
+/// non-blank source, and a cleanup layer with an image. User-authored text
+/// counts because no stage rewrites it. A page without detected text cannot be
+/// told apart from an unprocessed one, so it is not finished.
+fn finished(snapshot: &Snapshot, page: EntityId, target: &LanguageTag) -> Result<bool> {
+    let mut detected = false;
+    for entity in snapshot.descendants(page)? {
+        if !entity
+            .component::<Region>()?
+            .is_some_and(|region| region.kind == TextRegion::kind())
+        {
+            continue;
+        }
+        detected = true;
+        for relation in snapshot.relations_to_as::<RecognizedFrom>(entity.id()) {
+            if snapshot
+                .component::<SourceText>(relation.value().source)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    if !detected {
+        return Ok(false);
+    }
+    if let Some(group) = snapshot.page(page)?.text_group()? {
+        for layer in group.text_layers()? {
+            let content = layer.content()?;
+            if content
+                .source()?
+                .is_none_or(|source| source.text.value.trim().is_empty())
+            {
+                continue;
+            }
+            let translated = content.translation()?.is_some_and(|translation| {
+                matches!(translation.text.origin, Origin::User)
+                    || translation.language.as_ref() == Some(target)
+            });
+            if !translated {
+                return Ok(false);
+            }
+        }
+    }
+    let image = AssetRole::new("source")?;
+    for child in snapshot.children(page)? {
+        if snapshot
+            .component::<RasterLayer>(child)?
+            .is_some_and(|layer| layer.kind == RasterLayerKind::Cleanup)
+            && snapshot.asset(child, &image)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
