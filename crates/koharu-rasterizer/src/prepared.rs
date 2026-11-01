@@ -854,6 +854,27 @@ impl PreparedResource {
         Ok(resource)
     }
 
+    /// Builds an encoded raster whose `id` the caller already derived with
+    /// `ResourceId::for_encoded_raster` from these fields. Checks structure
+    /// only; `PreparedResourcePacket::decode` verifies the id.
+    pub fn encoded_raster_with_id(
+        id: ResourceId,
+        width: u32,
+        height: u32,
+        media_type: impl Into<String>,
+        bytes: Arc<[u8]>,
+    ) -> Result<Self> {
+        let resource = Self::EncodedRaster {
+            id,
+            width,
+            height,
+            media_type: media_type.into(),
+            bytes,
+        };
+        resource.validate_structure()?;
+        Ok(resource)
+    }
+
     fn validate(&self) -> Result<()> {
         self.validate_structure()?;
         match self {
