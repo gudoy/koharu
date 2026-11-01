@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use anyhow::{Result, bail};
+use image::GrayImage;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -13,7 +14,7 @@ use koharu_scene::EntityId;
 #[derive(Clone, Debug)]
 pub struct InpaintingMask {
     pub page: EntityId,
-    pub png: Arc<[u8]>,
+    pub mask: Arc<GrayImage>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Type)]
