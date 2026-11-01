@@ -227,7 +227,7 @@ struct OcrResult {
 async fn infer_text<M: Send + 'static>(
     model: Arc<Mutex<M>>,
     targets: Vec<OcrTarget>,
-    _stop: StopToken,
+    stop: StopToken,
     inference: impl Fn(&M, &DynamicImage) -> Result<String> + Send + Sync + 'static,
 ) -> Result<Vec<OcrResult>> {
     tokio_rayon::spawn(move || {
@@ -237,6 +237,9 @@ async fn infer_text<M: Send + 'static>(
         targets
             .into_iter()
             .map(|target| {
+                if stop.stopped() {
+                    bail!("OCR was stopped");
+                }
                 Ok(OcrResult {
                     content: target.content,
                     region: target.region,

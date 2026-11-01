@@ -147,9 +147,13 @@ impl StageRunner {
                 model: model.to_owned(),
             },
         );
-        self.stages
-            .process(job.stage, job.input.clone())
-            .await
+        let processed = self.stages.process(job.stage, job.input.clone()).await;
+        // Processors end long work early on stop. Their partial result or error
+        // is discarded and must not count as a stage failure that unloads the model.
+        if job.input.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        processed
             .map(|patch| {
                 if patch.is_empty() {
                     StageOutcome::Skipped

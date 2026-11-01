@@ -96,6 +96,8 @@ impl Translator {
         Ok(())
     }
 
+    /// Translates `request`. Local generation checks `stopped` after every token and a hosted
+    /// request is abandoned once it returns `true`; either way the translation fails as stopped.
     pub async fn translate(
         &self,
         selection: &ModelSelection,
@@ -181,11 +183,22 @@ impl Translator {
     }
 }
 
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Abandons a hosted request once `stopped` returns `true`. Dropping it is safe because it holds
+/// no accelerator work; local generation must observe the stop itself.
 async fn unless_stopped<T>(
     request: impl Future<Output = Result<T>>,
-    _stopped: &impl Fn() -> bool,
+    stopped: &impl Fn() -> bool,
 ) -> Result<T> {
-    request.await
+    tokio::select! {
+        result = request => result,
+        () = async {
+            while !stopped() {
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
+        } => Err(Error::Stopped),
+    }
 }
 
 #[cfg(test)]
