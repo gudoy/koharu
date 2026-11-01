@@ -775,7 +775,7 @@ impl MtmdInputChunks {
         if result == 0 {
             Ok(new_n_past)
         } else {
-            Err(MtmdEvalError::EvalFailure(result))
+            Err(MtmdEvalError::from_code(result))
         }
     }
 }
@@ -999,4 +999,18 @@ pub enum MtmdEvalError {
     /// Evaluation operation failed
     #[error("Eval failed with code: {0}")]
     EvalFailure(i32),
+    /// The helper forwarded `GGML_STATUS_ALLOC_FAILED` from an encode or decode.
+    #[error("Eval failed with code -2: out of memory allocating compute buffers")]
+    OutOfMemory,
+}
+
+impl MtmdEvalError {
+    /// Classifies a non-zero `mtmd_helper_eval_chunks` result.
+    #[must_use]
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            -2 => Self::OutOfMemory,
+            code => Self::EvalFailure(code),
+        }
+    }
 }

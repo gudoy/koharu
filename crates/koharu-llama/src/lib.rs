@@ -124,8 +124,9 @@ pub enum MetaValError {
 /// Failed to Load context
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LlamaContextLoadError {
-    /// llama.cpp returned null
-    #[error("null reference from llama.cpp")]
+    /// llama.cpp returned null. Context creation fails when the KV cache or
+    /// compute buffers cannot be allocated, so the message names memory.
+    #[error("llama.cpp returned null: not enough memory for the context buffers")]
     NullReturn,
 }
 
@@ -151,6 +152,9 @@ pub enum DecodeError {
     /// The number of tokens in the batch was 0.
     #[error("Decode Error -1: n_tokens == 0")]
     NTokensZero,
+    /// ggml could not allocate the compute graph (`GGML_STATUS_ALLOC_FAILED`).
+    #[error("Decode Error -2: out of memory allocating compute buffers")]
+    OutOfMemory,
     /// An unknown error occurred.
     #[error("Decode Error {0}: unknown")]
     Unknown(c_int),
@@ -165,6 +169,9 @@ pub enum EncodeError {
     /// The number of tokens in the batch was 0.
     #[error("Encode Error -1: n_tokens == 0")]
     NTokensZero,
+    /// ggml could not allocate the compute graph (`GGML_STATUS_ALLOC_FAILED`).
+    #[error("Encode Error -2: out of memory allocating compute buffers")]
+    OutOfMemory,
     /// An unknown error occurred.
     #[error("Encode Error {0}: unknown")]
     Unknown(c_int),
@@ -207,6 +214,7 @@ impl From<NonZeroI32> for DecodeError {
         match value.get() {
             1 => DecodeError::NoKvCacheSlot,
             -1 => DecodeError::NTokensZero,
+            -2 => DecodeError::OutOfMemory,
             i => DecodeError::Unknown(i),
         }
     }
@@ -218,6 +226,7 @@ impl From<NonZeroI32> for EncodeError {
         match value.get() {
             1 => EncodeError::NoKvCacheSlot,
             -1 => EncodeError::NTokensZero,
+            -2 => EncodeError::OutOfMemory,
             i => EncodeError::Unknown(i),
         }
     }
