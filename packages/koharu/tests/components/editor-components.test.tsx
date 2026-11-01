@@ -9,7 +9,7 @@ import {
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from 'next-themes'
-import { StrictMode, type ReactNode } from 'react'
+import { Profiler, StrictMode, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { TitleBar } from '@/components/app/TitleBar'
@@ -1754,6 +1754,35 @@ describe('greenfield editor', () => {
     render(<ResourceMonitor />)
     expect(screen.getByText('8%')).toBeInTheDocument()
     expect(screen.getByText('3%')).toBeInTheDocument()
+  })
+
+  it('re-renders model resources only when a displayed value changes', () => {
+    const sample = (cpu: number, memory: number) => ({
+      process_memory: memory,
+      system_memory: 64 * 1024 ** 3,
+      process_cpu: cpu,
+      devices: [],
+    })
+    useKoharuStore.setState({ resources: sample(8.1, 2 * 1024 ** 3) })
+    let renders = 0
+    render(
+      <Profiler id='resources' onRender={() => renders++}>
+        <ResourceMonitor />
+      </Profiler>,
+    )
+    const initial = renders
+
+    // Telemetry arrives every 100 ms; these samples all display as 8% and 2.0 GB.
+    for (let tick = 1; tick <= 10; tick++) {
+      act(() =>
+        useKoharuStore.setState({ resources: sample(8.1 + tick / 100, 2 * 1024 ** 3 + tick) }),
+      )
+    }
+    expect(renders).toBe(initial)
+
+    act(() => useKoharuStore.setState({ resources: sample(12, 2 * 1024 ** 3) }))
+    expect(renders).toBe(initial + 1)
+    expect(screen.getByText('12%')).toBeInTheDocument()
   })
 
   it('tracks arbitrary concurrent commands until each one settles', async () => {
