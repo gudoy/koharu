@@ -17,7 +17,7 @@ use koharu_scene::{
 const PRODUCER: &str = "dev.koharu.pipeline.ocr";
 
 pub(super) struct Processor {
-    config: OcrModel,
+    pub(super) config: OcrModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }

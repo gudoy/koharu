@@ -60,7 +60,7 @@ impl Default for RoremMixedConfig {
 }
 
 pub(super) struct Processor {
-    config: InpaintingModel,
+    pub(super) config: InpaintingModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }
