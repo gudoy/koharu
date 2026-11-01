@@ -84,6 +84,9 @@ struct GpuState {
     renderer: vello::Renderer,
     compositor: GpuCompositor,
     targets: Vec<RenderTarget>,
+    /// Bumped by `clear_resources`; a readback returns its target to the pool only
+    /// when no clear happened while the target was out.
+    generation: u64,
 }
 
 struct RenderTarget {
@@ -123,6 +126,7 @@ impl Rasterizer {
                 renderer,
                 compositor,
                 targets: Vec::new(),
+                generation: 0,
             }),
         })
     }
@@ -132,6 +136,7 @@ impl Rasterizer {
         let mut gpu = self.gpu.lock();
         gpu.compositor.clear_resources();
         gpu.targets.clear();
+        gpu.generation += 1;
     }
 
     pub fn rasterize(&self, frame: &Frame, options: RasterOptions) -> Result<Raster> {
@@ -270,7 +275,7 @@ impl Rasterizer {
             height,
             depth_or_array_layers: 1,
         };
-        let (device, submission, target) = {
+        let (device, submission, target, generation) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
                 device,
@@ -278,6 +283,7 @@ impl Rasterizer {
                 renderer,
                 compositor,
                 targets,
+                generation,
             } = &mut *gpu;
             let device = device.clone();
             check_device_limit(&device, width, height)?;
@@ -311,10 +317,10 @@ impl Rasterizer {
                 size,
             );
             let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
+            (device, submission, target, *generation)
         };
         // Compositor targets are premultiplied; native images expose straight RGBA.
-        self.finish_readback(device, submission, target, true)
+        self.finish_readback(device, submission, target, generation, true)
     }
 
     fn readback_scene(
@@ -329,7 +335,7 @@ impl Rasterizer {
             height,
             depth_or_array_layers: 1,
         };
-        let (device, submission, target) = {
+        let (device, submission, target, generation) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
                 device,
@@ -337,6 +343,7 @@ impl Rasterizer {
                 renderer,
                 compositor: _,
                 targets,
+                generation,
             } = &mut *gpu;
             let device = device.clone();
             check_device_limit(&device, width, height)?;
@@ -371,9 +378,9 @@ impl Rasterizer {
                 size,
             );
             let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
+            (device, submission, target, *generation)
         };
-        self.finish_readback(device, submission, target, false)
+        self.finish_readback(device, submission, target, generation, false)
     }
 
     fn finish_readback(
@@ -381,6 +388,7 @@ impl Rasterizer {
         device: wgpu::Device,
         submission: wgpu::SubmissionIndex,
         target: RenderTarget,
+        generation: u64,
         premultiplied: bool,
     ) -> AnyResult<Vec<u8>> {
         let width = target.width;
@@ -430,7 +438,7 @@ impl Rasterizer {
         drop(mapped);
         target.readback.unmap();
         let mut gpu = self.gpu.lock();
-        if gpu.targets.len() < 4 {
+        if gpu.generation == generation && gpu.targets.len() < 4 {
             gpu.targets.push(target);
         }
         Ok(pixels)
@@ -650,5 +658,27 @@ mod tests {
         let gpu = rasterizer.gpu.lock();
         assert_eq!(gpu.compositor.cached_resource_count(), 0);
         assert!(gpu.targets.is_empty());
+    }
+
+    #[test]
+    fn clearing_resources_drops_targets_of_inflight_readbacks() {
+        let rasterizer = Rasterizer::new().unwrap();
+        let (device, submission, target, generation) = {
+            let mut gpu = rasterizer.gpu.lock();
+            let device = gpu.device.clone();
+            let target = take_target(&mut gpu.targets, &device, 2, 1).unwrap();
+            let submission = gpu.queue.submit([]);
+            (device, submission, target, gpu.generation)
+        };
+
+        rasterizer.clear_resources();
+        rasterizer
+            .finish_readback(device, submission, target, generation, false)
+            .unwrap();
+
+        assert!(
+            rasterizer.gpu.lock().targets.is_empty(),
+            "a target taken before clearing must not return to the pool"
+        );
     }
 }
