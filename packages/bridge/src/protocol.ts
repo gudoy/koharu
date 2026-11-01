@@ -12,7 +12,7 @@ export const commands = {
 	saveAgentConfig: (config: Config) => __TAURI_INVOKE<Config>("save_agent_config", { config }),
 	runAgent: (prompt: string, onEvent: Channel<Event>) => __TAURI_INVOKE<RunId>("run_agent", { prompt, onEvent }),
 	cancelAgent: (run: RunId) => __TAURI_INVOKE<null>("cancel_agent", { run }),
-	subscribe: (onCanvas: Channel<CanvasState>, onJob: Channel<Job>, onDownload: Channel<Download>, onResources: Channel<ModelResources>, onProject: Channel<ProjectInfo | null>) => __TAURI_INVOKE<StartupState>("subscribe", { onCanvas, onJob, onDownload, onResources, onProject }),
+	subscribe: (onCanvas: Channel<CanvasState>, onJob: Channel<Job>, onDownload: Channel<Download>, onResources: Channel<ModelResources>, onProject: Channel<ProjectInfo | null>, onBatch: Channel<BatchState>) => __TAURI_INVOKE<StartupState>("subscribe", { onCanvas, onJob, onDownload, onResources, onProject, onBatch }),
 	getProject: () => __TAURI_INVOKE<ProjectInfo | null>("get_project"),
 	getPages: () => __TAURI_INVOKE<PageSummary[]>("get_pages"),
 	getPage: () => __TAURI_INVOKE<Page | null>("get_page"),
@@ -38,11 +38,17 @@ export const commands = {
 	process: (scope: Scope, operation: Operation) => __TAURI_INVOKE<JobId>("process", { scope, operation }),
 	stopJob: (job: JobId) => __TAURI_INVOKE<null>("stop_job", { job }),
 	export: (format: ExportFormat) => __TAURI_INVOKE<null>("export", { format }),
+	pickBatchFolders: (title: string, multiple: boolean) => __TAURI_INVOKE<string[]>("pick_batch_folders", { title, multiple }),
 	/**
-	 *  Translates every subfolder of a chosen source folder as its own project and
-	 *  exports each one as PSD and PNG into a same-named folder of the destination.
+	 *  Describes project folders with their page counts and, when a destination is
+	 *  chosen, the outcome its report recorded for each. With `expand`, every
+	 *  subfolder of each of `folders` is a project instead of the folder itself.
 	 */
-	batch: () => __TAURI_INVOKE<null>("batch"),
+	scanBatch: (folders: string[], expand: boolean, destination: string | null) => __TAURI_INVOKE<BatchFolder[]>("scan_batch", { folders, expand, destination }),
+	startBatch: (config: BatchConfig) => __TAURI_INVOKE<null>("start_batch", { config }),
+	controlBatch: (request: BatchRequest) => __TAURI_INVOKE<null>("control_batch", { request }),
+	/**  Answers the pending question about an already translated folder. */
+	resolveBatch: (replace: boolean, all: boolean) => __TAURI_INVOKE<null>("resolve_batch", { replace, all }),
 	getThumbnail: (page: EntityId) => __TAURI_INVOKE<ThumbnailBytes>("get_thumbnail", { page }),
 	getFonts: () => __TAURI_INVOKE<FontFamily[]>("get_fonts"),
 	getFontPreview: (familyName: string) => __TAURI_INVOKE<FontPreviewBytes>("get_font_preview", { familyName }),
@@ -82,6 +88,73 @@ export type AnalysisRegion = {
 	geometry: Geometry,
 	kind: string,
 	label: string | null,
+};
+
+export type BatchConfig = {
+	destination: string,
+	/**
+	 *  Project folders to translate, in processing order. A folder's name
+	 *  names its project and its export.
+	 */
+	folders: string[],
+	formats: ExportFormat[],
+	/**  Ends the batch at the first failed folder instead of continuing. */
+	stop_on_error: boolean,
+	existing: Existing,
+};
+
+/**  A project folder, described before the batch starts. */
+export type BatchFolder = {
+	path: string,
+	name: string,
+	pages: number,
+	previous: ReportStatus | null,
+	error: string | null,
+	/**
+	 *  Whether the destination already holds this folder's export or the
+	 *  report records it as done.
+	 */
+	exists: boolean,
+};
+
+export type BatchProject = {
+	name: string,
+	pages: number,
+	state: BatchProjectState,
+	/**  Files written so far across every export format. */
+	exported: number,
+	error: string | null,
+	/**  Time spent translating and exporting, pauses excluded. */
+	seconds: number,
+	/**
+	 *  Unix time in milliseconds when the running attempt began, so the view
+	 *  can add the time elapsed since the last update.
+	 */
+	since: number | null,
+};
+
+export type BatchProjectState = "pending" | "processing" | "exporting" | "done" | "skipped" | "failed" | "stopped";
+
+/**  What the user last asked of the running batch. */
+export type BatchRequest = "run" | "pause" | "stop";
+
+export type BatchRun = "running" | "pausing" | "paused" | 
+/**  Waiting for the user to decide about an already translated folder. */
+"waiting" | "stopping" | "finished" | "stopped";
+
+export type BatchState = {
+	state: BatchRun,
+	destination: string,
+	exports: number,
+	/**
+	 *  The pipeline job of the folder being processed; its progress is
+	 *  published on the job channel.
+	 */
+	job: JobId | null,
+	projects: BatchProject[],
+	/**  The already translated folder awaiting a decision. */
+	conflict: string | null,
+	error: string | null,
 };
 
 export type Bounds = {
@@ -163,6 +236,9 @@ export type EntityId = string;
 export type Error = string;
 
 export type Event = { type: "started"; run: RunId } | { type: "text_delta"; run: RunId; delta: string } | { type: "reasoning_delta"; run: RunId; delta: string } | { type: "tool_started"; run: RunId; call_id: string; name: string } | { type: "tool_finished"; run: RunId; call_id: string; name: string; changed: boolean; output: string } | { type: "completed"; run: RunId; message: string } | { type: "failed"; run: RunId; message: string } | { type: "cancelled"; run: RunId };
+
+/**  What to do with a folder that was already translated into the destination. */
+export type Existing = "ask" | "replace" | "skip";
 
 export type ExportFormat = "png" | "psd" | "cbz";
 
@@ -431,6 +507,15 @@ export type RasterLayerKind = "cleanup" | "paint";
 
 export type Reasoning = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
+/**  Outcome of a folder in an earlier run, as recorded in the report file. */
+export type ReportStatus = "running" | "done" | 
+/**
+ *  Exported, but some pages failed a stage; `error` lists them. A rerun
+ *  skips the folder like a done one. Removing its entry retries only the
+ *  unfinished pages.
+ */
+"partial" | "failed" | "stopped";
+
 export type Revision = number;
 
 export type RoremMixedConfig = {
@@ -455,6 +540,7 @@ export type Stage = "detection" | "ocr" | "translation" | "inpainting";
 export type StartupState = {
 	preferences: Preferences,
 	jobs: Job[],
+	batch: BatchState | null,
 	canvas: CanvasState,
 };
 

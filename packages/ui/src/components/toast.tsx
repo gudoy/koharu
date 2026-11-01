@@ -186,7 +186,8 @@ function ToastList() {
     <Toast key={toastItem.id} toast={toastItem}>
       <ToastContent>
         <ToastIcon type={toastItem.type} />
-        <div className="flex min-w-0 flex-1 flex-col gap-1">
+        {/* Bounded so a long message cannot push the close button off screen. */}
+        <div className="flex max-h-[min(16rem,calc(100dvh-6rem))] min-w-0 flex-1 flex-col gap-1 overflow-y-auto overscroll-contain break-words select-text">
           <ToastTitle />
           <ToastDescription />
         </div>

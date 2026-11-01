@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::commands::{
     agent::AgentState,
-    batch::Batch,
+    batch::{Batch, BatchChannel, BatchControl, BatchRequest},
     canvas::CanvasChannel,
     lifecycle::{
         Download, DownloadChannel, DownloadState, Initialization, ModelResources, ProjectChannel,
@@ -106,6 +106,8 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
             application.manage(ResourceChannel::default());
             application.manage(ProjectChannel::default());
             application.manage(Initialization::default());
+            application.manage(BatchControl::default());
+            application.manage(BatchChannel::default());
 
             let handle = application.handle().clone();
             application.manage(koharu_desktop::Desktop::new()?);
@@ -219,6 +221,10 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
                 event,
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
             ) {
+                window
+                    .state::<BatchControl>()
+                    .request
+                    .send_replace(BatchRequest::Stop);
                 let processing = window.state::<Processing>();
                 for stop in processing.stops.lock().values() {
                     stop.stop();

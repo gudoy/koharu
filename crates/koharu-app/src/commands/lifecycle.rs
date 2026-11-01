@@ -14,6 +14,7 @@ use walkdir::WalkDir;
 use super::{
     ChannelExt as _, Error,
     agent::AgentState,
+    batch::{BatchChannel, BatchControl, BatchState},
     canvas::CanvasChannel,
     import,
     preferences::Preferences,
@@ -27,6 +28,7 @@ use super::{
 pub struct StartupState {
     pub preferences: Preferences,
     pub jobs: Vec<Job>,
+    pub batch: Option<BatchState>,
     pub canvas: CanvasState,
 }
 
@@ -216,12 +218,14 @@ pub(crate) async fn subscribe(
     on_download: Channel<Download>,
     on_resources: Channel<ModelResources>,
     on_project: Channel<Option<ProjectInfo>>,
+    on_batch: Channel<BatchState>,
 ) -> std::result::Result<StartupState, Error> {
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);
     handle.state::<ResourceChannel>().replace(on_resources);
     *handle.state::<ProjectChannel>().channel.lock() = Some(on_project);
+    *handle.state::<BatchChannel>().channel.lock() = Some(on_batch);
 
     let canvas = handle.state::<Desktop>().canvas_state();
     let preferences = Preferences::load()?;
@@ -234,6 +238,7 @@ pub(crate) async fn subscribe(
             .values()
             .cloned()
             .collect(),
+        batch: handle.state::<BatchControl>().state.lock().clone(),
         canvas,
     })
 }

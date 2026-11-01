@@ -3,6 +3,7 @@
 import { create } from 'zustand'
 
 import type {
+  BatchState,
   CanvasState,
   Download,
   EntityId,
@@ -45,6 +46,8 @@ interface KoharuStore {
   translationModels: Model[]
   resources: ModelResources | null
   jobs: Record<string, Job>
+  batch: BatchState | null
+  batchOpen: boolean
   downloads: Record<string, Download>
   camera: { zoom: number; translation: [number, number]; fitted: boolean }
   canvasPage: EntityId | null
@@ -67,6 +70,8 @@ interface KoharuStore {
   setProcessingScope: (scope: PipelineScope) => void
   setProcessingStages: (stages: Stage[]) => void
   setSettingsOpen: (open: boolean) => void
+  setBatchOpen: (open: boolean) => void
+  dismissBatch: () => void
   selectLayers: (layers: EntityId[]) => void
   setTool: (tool: CanvasTool) => void
   setBrush: (brush: CanvasBrush) => void
@@ -93,6 +98,8 @@ export const useKoharuStore = create<KoharuStore>()((set) => ({
   translationModels: [],
   resources: null,
   jobs: {},
+  batch: null,
+  batchOpen: false,
   downloads: {},
   camera: { zoom: 1, translation: [0, 0], fitted: true },
   canvasPage: null,
@@ -115,6 +122,8 @@ export const useKoharuStore = create<KoharuStore>()((set) => ({
   setProcessingScope: (processingScope) => set({ processingScope }),
   setProcessingStages: (processingStages) => set({ processingStages }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
+  setBatchOpen: (batchOpen) => set({ batchOpen }),
+  dismissBatch: () => set({ batch: null }),
   selectLayers: (selectedLayers) => set({ selectedLayers: [...new Set(selectedLayers)] }),
   setTool: (tool) => set({ tool }),
   setBrush: (brush) => set({ brush }),
@@ -142,6 +151,7 @@ export function receiveStartupState(state: StartupState): void {
     initialized: true,
     preferences: state.preferences,
     jobs: byId(state.jobs),
+    batch: state.batch,
     ...canvasSnapshot(state.canvas),
   })
 }
@@ -152,6 +162,10 @@ export function receiveCanvas(canvas: CanvasState): void {
 
 export function receiveJob(job: Job): void {
   useKoharuStore.setState((state) => ({ jobs: { ...state.jobs, [job.id]: job } }))
+}
+
+export function receiveBatch(batch: BatchState): void {
+  useKoharuStore.setState({ batch })
 }
 
 export function receiveDownload(download: Download): void {
