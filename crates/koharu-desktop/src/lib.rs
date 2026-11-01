@@ -349,6 +349,21 @@ impl Desktop {
             return Ok(false);
         };
         let rendered = rendered?;
+        if previous
+            .as_ref()
+            .is_some_and(|previous| rendered.same_content(previous))
+        {
+            // Only the revision moved. Keep the generation so the webview does not prepare the
+            // same content again, but store the frame so the next update stays contiguous.
+            let mut presentation = self.presentation.write();
+            if presentation.requested_preparation != request {
+                return Ok(false);
+            }
+            presentation.frame = Some(rendered.clone());
+            drop(presentation);
+            self.page_frames.lock().insert(rendered);
+            return Ok(true);
+        }
         if !self.replace_frame_if_current(request, Some(rendered)) {
             return Ok(false);
         }
@@ -539,7 +554,7 @@ fn transform_point([a, b, c, d, e, f]: [f64; 6], point: &Point) -> Point {
 mod tests {
     use std::{future::pending, sync::Arc, time::Duration};
 
-    use koharu_scene::{At, Origin, PageDraft, Session, Visibility};
+    use koharu_scene::{At, Group, Origin, PageDraft, Session, Snapshot, Visibility};
     use tokio::{sync::Notify, time::timeout};
 
     use super::Desktop;
@@ -639,5 +654,61 @@ mod tests {
         assert_eq!(cached.iter().filter(|(page, _)| *page == first).count(), 1);
         assert!(cached.contains(&(first, snapshot.revision())));
         assert!(cached.iter().any(|(page, _)| *page == second));
+    }
+
+    #[tokio::test]
+    async fn commit_on_another_page_keeps_the_canvas_generation() {
+        let mut session = Session::memory().await.unwrap();
+        let mut pages = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let shown = edit.add_page(PageDraft::new("shown", 10.0, 10.0), At::End)?;
+                let other = edit.add_page(PageDraft::new("other", 10.0, 10.0), At::End)?;
+                pages = Some((shown, other));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let (shown, other) = pages.unwrap();
+        let desktop = Desktop::new().unwrap();
+        assert!(desktop.show_page(&snapshot, Some(shown)).await.unwrap());
+        let shown_generation = desktop.canvas_state().generation;
+
+        let add_group = |snapshot: &Snapshot, page| {
+            snapshot
+                .patch(|edit| {
+                    let group = edit.add_entity(page, At::End)?;
+                    edit.set(
+                        group,
+                        &Group {
+                            origin: Origin::User,
+                            name: "group".to_owned(),
+                        },
+                    )
+                })
+                .unwrap()
+        };
+        let elsewhere = session.commit(add_group(&snapshot, other)).await.unwrap();
+        desktop
+            .synchronize(&elsewhere.snapshot, Some(shown), &elsewhere)
+            .await
+            .unwrap();
+        let canvas = desktop.canvas_state();
+        assert_eq!(canvas.generation, shown_generation);
+        assert_eq!(canvas.revision, Some(elsewhere.snapshot.revision()));
+        assert!(desktop.frame_manifest_bytes(canvas.generation).is_ok());
+
+        let here = session
+            .commit(add_group(&elsewhere.snapshot, shown))
+            .await
+            .unwrap();
+        desktop
+            .synchronize(&here.snapshot, Some(shown), &here)
+            .await
+            .unwrap();
+        let canvas = desktop.canvas_state();
+        assert_ne!(canvas.generation, shown_generation);
+        assert_eq!(canvas.revision, Some(here.snapshot.revision()));
     }
 }
