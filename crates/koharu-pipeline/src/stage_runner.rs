@@ -52,6 +52,11 @@ impl StageRunner {
         self.stages.shares_processor(&other.stages, stage)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_processor(&mut self, processor: Arc<dyn crate::stages::StageProcessor>) {
+        self.stages.set_test_processor(processor);
+    }
+
     #[tracing::instrument(skip_all)]
     pub(crate) async fn run(&self, job: StageJob) -> StageCompletion {
         let started = Instant::now();

@@ -56,10 +56,15 @@ impl StageInput {
             entity,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn scene(&self) -> &Snapshot {
+        &self.scene
+    }
 }
 
 #[async_trait]
-trait StageProcessor: Send + Sync {
+pub(crate) trait StageProcessor: Send + Sync {
     fn model(&self) -> &'static str;
     fn skip(&self, _input: &StageInput) -> Result<bool> {
         Ok(false)
@@ -74,6 +79,8 @@ pub(crate) struct Stages {
     ocr: Arc<ocr::Processor>,
     translation: translation::Processor,
     inpainting: Arc<inpainting::Processor>,
+    #[cfg(test)]
+    test_processor: Option<Arc<dyn StageProcessor>>,
 }
 
 impl Stages {
@@ -93,6 +100,8 @@ impl Stages {
                 config.inpainting()?,
                 device.clone(),
             )?),
+            #[cfg(test)]
+            test_processor: None,
         })
     }
 
@@ -118,7 +127,17 @@ impl Stages {
         Ok(next)
     }
 
+    /// Routes every stage to `processor` so runner tests need no model weights.
+    #[cfg(test)]
+    pub(crate) fn set_test_processor(&mut self, processor: Arc<dyn StageProcessor>) {
+        self.test_processor = Some(processor);
+    }
+
     fn processor(&self, stage: Stage) -> &dyn StageProcessor {
+        #[cfg(test)]
+        if let Some(processor) = self.test_processor.as_deref() {
+            return processor;
+        }
         match stage {
             Stage::Detection => self.detection.as_ref(),
             Stage::Ocr => self.ocr.as_ref(),
