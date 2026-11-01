@@ -205,3 +205,28 @@ opt-level = 3
 
 [profile.dev.package.libwebp-sys]
 opt-level = 3
+
+# A package override does not reach its dependencies, so the codec crates that
+# `image` calls into need their own: PNG unfiltering, fdeflate (PNG inflate and
+# fast deflate), zlib-rs (leveled PNG deflate; `zip` makes it the flate2
+# backend, and flate2 itself is a thin wrapper), checksums and JPEG decode.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
