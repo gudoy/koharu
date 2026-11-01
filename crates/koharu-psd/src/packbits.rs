@@ -49,39 +49,38 @@ pub fn encode_image_rle(
     layer_name: &str,
 ) -> Result<Vec<EncodedChannel>, PsdExportError> {
     let mut encoded = Vec::with_capacity(channels.len());
+    let mut row = Vec::with_capacity(image.width() as usize);
+    let row_bytes = image.width() as usize * 4;
 
     for channel in channels {
-        let mut lengths = Vec::with_capacity(image.height() as usize);
-        let mut data = Vec::new();
-        let width = image.width() as usize;
         let offset = channel.rgba_offset();
+        // The big-endian row-length table precedes the payload; each entry is
+        // filled in once its row is encoded.
+        let mut data = vec![0; image.height() as usize * 2];
 
-        for y in 0..image.height() {
+        for y in 0..image.height() as usize {
+            let pixels = &image.as_raw()[y * row_bytes..][..row_bytes];
+            row.clear();
+            row.extend(pixels.as_chunks::<4>().0.iter().map(|pixel| pixel[offset]));
             let start = data.len();
-            let mut row = Vec::with_capacity(width);
-            for x in 0..image.width() {
-                row.push(image.get_pixel(x, y).0[offset]);
-            }
             encode_row(&row, &mut data);
             let row_length = data.len() - start;
             if row_length > u16::MAX as usize {
                 return Err(PsdExportError::InvalidChannelEncoding {
                     layer: layer_name.to_string(),
-                    row: y as usize,
+                    row: y,
                     length: row_length,
                 });
             }
-            lengths.push(row_length as u16);
+            data[y * 2..y * 2 + 2].copy_from_slice(&(row_length as u16).to_be_bytes());
         }
+        // Every channel stays alive until the PSD is serialized; drop the
+        // growth slack so it holds no more than its encoded bytes.
+        data.shrink_to_fit();
 
-        let mut out = Vec::with_capacity(lengths.len() * 2 + data.len());
-        for length in lengths {
-            out.extend_from_slice(&length.to_be_bytes());
-        }
-        out.extend_from_slice(&data);
         encoded.push(EncodedChannel {
             channel_id: channel.psd_id(),
-            data: out,
+            data,
         });
     }
 
