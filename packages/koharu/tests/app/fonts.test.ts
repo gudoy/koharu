@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { readFileSync, statSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 import { describe, expect, it } from 'vitest'
@@ -63,12 +63,28 @@ function fetchedFontBytes(locale: keyof typeof resources) {
   // Interface-language names render only in the settings language picker.
   const text = JSON.stringify({ ...resources[locale].translation, languages: {} })
   const codePoints = Array.from(new Set(text), (character) => character.codePointAt(0)!)
-  return uiFontFaces()
+  const faces = uiFontFaces()
+  // An uncovered character falls back to a system font and costs nothing, so a lost face or a
+  // shrunken range would otherwise pass as a smaller download.
+  const uncovered = codePoints.filter((codePoint) => !faces.some((face) => face.covers(codePoint)))
+  expect(uncovered.map((codePoint) => String.fromCodePoint(codePoint))).toEqual([])
+  return faces
     .filter((face) => codePoints.some(face.covers))
     .reduce((bytes, face) => bytes + face.bytes, 0)
 }
 
 describe('interface font', () => {
+  it('declares one face per generated slice', () => {
+    const slices = readdirSync(path.join(fontsDir, 'noto-sans-cjk'))
+      .filter((file) => file.endsWith('.otf'))
+      .map((file) => `./noto-sans-cjk/${file}`)
+    expect(
+      uiFontFaces()
+        .map((face) => face.file)
+        .sort(),
+    ).toEqual(slices.sort())
+  })
+
   it('fetches only the non-CJK slice for an English interface', () => {
     expect(fetchedFontBytes('en-US')).toBeLessThan(1_000_000)
   })
