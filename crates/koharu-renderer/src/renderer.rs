@@ -48,6 +48,10 @@ use crate::{
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
+/// Image nodes pin their decoded pixels, so the entry count alone lets a long
+/// session retain every page it has rendered. Pixels shared with the image
+/// cache or another node are counted per node, so this is an upper bound.
+const DEFAULT_RETAINED_NODE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
 const MINIMUM_FONT_SIZE: f32 = 9.0;
@@ -105,7 +109,10 @@ impl Renderer {
                 fonts: Arc::new(Fonts::new()),
                 images: Mutex::new(ImageCache::new()),
                 image_loads: Mutex::new(HashMap::new()),
-                nodes: Mutex::new(NodeCache::new(DEFAULT_RETAINED_NODES)),
+                nodes: Mutex::new(NodeCache::new(
+                    DEFAULT_RETAINED_NODES,
+                    DEFAULT_RETAINED_NODE_BYTES,
+                )),
                 workers: OnceLock::new(),
             }),
         }
@@ -235,7 +242,7 @@ impl Renderer {
 
     /// Discards retained Vello nodes after their presentation resource lifetime ends.
     pub fn discard_retained_nodes(&self) {
-        self.inner.nodes.lock().entries.clear();
+        self.inner.nodes.lock().clear();
     }
 
     async fn finish(
@@ -1470,15 +1477,40 @@ struct CachedNode {
 struct NodeCache {
     entries: HashMap<(EntityId, EntityId), CachedNode>,
     capacity: usize,
+    max_bytes: usize,
+    bytes: usize,
     clock: u64,
 }
 
 impl NodeCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             capacity,
+            max_bytes,
+            bytes: 0,
             clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    /// Bytes the node keeps alive on its own. Text nodes share font data with
+    /// the font cache, so only image nodes carry a page-sized cost.
+    fn retained_bytes(node: &RetainedNode) -> usize {
+        node.image.as_ref().map_or(0, |image| {
+            image.pixels.len().saturating_add(image.encoded.len())
+        })
+    }
+
+    fn remove(&mut self, key: &(EntityId, EntityId)) {
+        if let Some(removed) = self.entries.remove(key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(Self::retained_bytes(&removed.node));
         }
     }
 
@@ -1502,9 +1534,12 @@ impl NodeCache {
     }
 
     fn insert(&mut self, key: (EntityId, EntityId), node: Arc<RetainedNode>, clock: u64) {
-        if self.capacity == 0 {
+        self.remove(&key);
+        let bytes = Self::retained_bytes(&node);
+        if self.capacity == 0 || bytes > self.max_bytes {
             return;
         }
+        self.bytes = self.bytes.saturating_add(bytes);
         self.entries.insert(
             key,
             CachedNode {
@@ -1512,7 +1547,7 @@ impl NodeCache {
                 last_used: clock,
             },
         );
-        while self.entries.len() > self.capacity {
+        while self.entries.len() > self.capacity || self.bytes > self.max_bytes {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -1521,7 +1556,7 @@ impl NodeCache {
             else {
                 break;
             };
-            self.entries.remove(&oldest);
+            self.remove(&oldest);
         }
     }
 }
@@ -1795,6 +1830,55 @@ mod tests {
                 attributes: BTreeMap::new(),
             },
         )
+    }
+
+    fn image_node(blob: BlobId, width: u32, height: u32) -> Arc<RetainedNode> {
+        let image = Arc::new(DecodedImage {
+            width,
+            height,
+            encoded: Arc::from(vec![0_u8; 16]),
+            pixels: Arc::from(vec![0_u8; width as usize * height as usize * 4]),
+        });
+        let descriptor = NodeDescriptor::Image(ImageNodeDescriptor {
+            blob,
+            media_type: "image/png".to_owned(),
+            expected_size: None,
+            require_size: None,
+        });
+        Arc::new(build_node(descriptor, &Fonts::new(), &HashMap::from([(blob, image)])).unwrap())
+    }
+
+    #[test]
+    fn retained_image_nodes_are_bounded_by_bytes() {
+        // Each node pins 4 KiB of pixels; the budget holds three of them.
+        let mut cache = NodeCache::new(2_048, 3 * (4 * 1024 + 16));
+        let page = EntityId::new();
+        let entities = (0..8).map(|_| EntityId::new()).collect::<Vec<_>>();
+        for (index, entity) in entities.iter().enumerate() {
+            let clock = cache.next_clock();
+            let blob = BlobId::for_bytes(format!("image-{index}").as_bytes());
+            cache.insert((page, *entity), image_node(blob, 32, 32), clock);
+        }
+
+        assert_eq!(cache.entries.len(), 3);
+        assert!(cache.bytes <= cache.max_bytes);
+        for entity in &entities[5..] {
+            assert!(cache.entries.contains_key(&(page, *entity)));
+        }
+    }
+
+    #[test]
+    fn replacing_a_retained_node_releases_its_bytes() {
+        let mut cache = NodeCache::new(2_048, usize::MAX);
+        let key = (EntityId::new(), EntityId::new());
+        let clock = cache.next_clock();
+        cache.insert(key, image_node(BlobId::for_bytes(b"a"), 32, 32), clock);
+        let clock = cache.next_clock();
+        cache.insert(key, image_node(BlobId::for_bytes(b"b"), 16, 16), clock);
+
+        assert_eq!(cache.bytes, 16 * 16 * 4 + 16);
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
