@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use koharu_rasterizer::{
     PreparedGlyph, PreparedGlyphRun, PreparedResource, PreparedScene, PreparedSceneCommand,
-    ResourceId,
 };
 use vello::kurbo::Affine;
 
@@ -402,9 +401,10 @@ fn draw_layout(
                 pen_y -= glyph.y_advance;
             }
 
-            let font_id = ResourceId::for_font(font.bytes());
+            let font_resource = font.resource();
+            let font_id = font_resource.id();
             if !resources.iter().any(|candidate| candidate.id() == font_id) {
-                resources.push(PreparedResource::font_shared(font.shared_bytes()));
+                resources.push(font_resource.clone());
             }
             let glyph_transform = font
                 .synthetic_skew()

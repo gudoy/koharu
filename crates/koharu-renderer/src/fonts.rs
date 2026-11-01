@@ -12,6 +12,7 @@ use fontique::{
     GenericFamily, Language, QueryFamily, QueryFont, QueryStatus, Script, SourceCache,
 };
 use harfrust::{Buffer, ShapeOptions, ShapePlan, ShapePlanKey, ShaperFont, font::Variation};
+use koharu_rasterizer::PreparedResource;
 use koharu_runtime::HuggingFaceFile;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -63,7 +64,10 @@ fn symbol_fallback_families() -> &'static [String] {
 #[derive(Clone)]
 pub struct Font {
     data: Blob<u8>,
-    bytes: Arc<OnceLock<Arc<[u8]>>>,
+    /// The font as a renderer resource. Built on first use and shared by
+    /// clones, so the font file is copied and hashed once rather than per
+    /// glyph run.
+    resource: Arc<OnceLock<PreparedResource>>,
     index: u32,
     family_name: String,
     font_name: String,
@@ -134,7 +138,7 @@ impl Font {
 
         Ok(Self {
             data: font.blob,
-            bytes: Arc::new(OnceLock::new()),
+            resource: Arc::new(OnceLock::new()),
             index: font.index,
             family_name,
             font_name,
@@ -147,14 +151,9 @@ impl Font {
         })
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
-        self.bytes
-            .get_or_init(|| Arc::from(self.data.as_ref()))
-            .as_ref()
-    }
-
-    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
-        Arc::clone(self.bytes.get_or_init(|| Arc::from(self.data.as_ref())))
+    pub(crate) fn resource(&self) -> &PreparedResource {
+        self.resource
+            .get_or_init(|| PreparedResource::font(self.data.as_ref()))
     }
 
     pub(crate) const fn index(&self) -> u32 {
