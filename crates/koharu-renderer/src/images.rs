@@ -51,6 +51,11 @@ impl ImageCache {
         }
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
     pub(crate) fn get(&mut self, blob: BlobId) -> Option<Arc<DecodedImage>> {
         self.clock = self.clock.wrapping_add(1);
         let entry = self.entries.get_mut(&blob)?;

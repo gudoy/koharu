@@ -375,6 +375,9 @@ impl Desktop {
         }
         if self.replace_frame_if_current(request, None) {
             self.renderer.discard_retained_nodes();
+            if let Some(rasterizer) = self.rasterizer.get() {
+                rasterizer.clear_resources();
+            }
         }
     }
 
