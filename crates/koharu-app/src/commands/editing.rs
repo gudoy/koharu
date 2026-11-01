@@ -99,6 +99,7 @@ pub(crate) async fn move_page(
 pub(crate) async fn set_source_text(
     layer: EntityId,
     text: String,
+    draft: bool,
     desktop: State<'_, Desktop>,
     project: State<'_, CurrentProject>,
     canvas_channel: State<'_, CanvasChannel>,
@@ -106,8 +107,8 @@ pub(crate) async fn set_source_text(
     let (commit, page) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
-        let commit = project.set_source_text(layer, text).await?;
-        project.record_commit(&commit);
+        let commit = project.set_source_text(layer, text, draft).await?;
+        project.record_text_edit(layer, &commit, draft);
         (commit, project.active_page())
     };
     let canvas = synchronize_canvas(&desktop, &commit, page).await?;
@@ -120,6 +121,7 @@ pub(crate) async fn set_source_text(
 pub(crate) async fn set_translation(
     layer: EntityId,
     text: Option<String>,
+    draft: bool,
     desktop: State<'_, Desktop>,
     project: State<'_, CurrentProject>,
     canvas_channel: State<'_, CanvasChannel>,
@@ -127,8 +129,8 @@ pub(crate) async fn set_translation(
     let (commit, page) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
-        let commit = project.set_translation(layer, text).await?;
-        project.record_commit(&commit);
+        let commit = project.set_translation(layer, text, draft).await?;
+        project.record_text_edit(layer, &commit, draft);
         (commit, project.active_page())
     };
     let canvas = synchronize_canvas(&desktop, &commit, page).await?;

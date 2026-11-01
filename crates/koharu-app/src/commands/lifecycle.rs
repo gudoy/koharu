@@ -237,6 +237,9 @@ pub(crate) async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Proj
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
+        if let Some(previous) = current.as_mut() {
+            previous.session.persist().await?;
+        }
         current.replace(opened)
     };
 
@@ -362,6 +365,9 @@ async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
+        if let Some(previous) = current.as_mut() {
+            previous.session.persist().await?;
+        }
         current.take()
     };
     let desktop = handle.state::<Desktop>();

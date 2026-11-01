@@ -322,7 +322,9 @@ impl Host for KoharuHost {
                 self.mutate(|project| {
                     Box::pin(async move {
                         Ok((
-                            project.set_source_text(element, arguments.text).await?,
+                            project
+                                .set_source_text(element, arguments.text, false)
+                                .await?,
                             json!({ "element": element }),
                         ))
                     })
@@ -335,7 +337,9 @@ impl Host for KoharuHost {
                 self.mutate(|project| {
                     Box::pin(async move {
                         Ok((
-                            project.set_translation(element, arguments.text).await?,
+                            project
+                                .set_translation(element, arguments.text, false)
+                                .await?,
                             json!({ "element": element }),
                         ))
                     })
