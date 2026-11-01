@@ -37,7 +37,9 @@ const canvasState = vi.hoisted(() => ({
   retry: vi.fn(),
   status: 'ready' as 'loading' | 'switching' | 'ready' | 'recovering' | 'error',
 }))
-const prefetchCanvasPages = vi.hoisted(() => vi.fn(async () => []))
+const prefetchCanvasPages = vi.hoisted(() =>
+  vi.fn(async (pages: string[]) => pages.map((id) => ({ page: { id }, revision: 1 }))),
+)
 
 vi.mock('@/components/editor/useCanvas', () => ({
   useCanvas: () => canvasState,
@@ -85,6 +87,7 @@ beforeEach(() => {
     return frame
   })
   vi.stubGlobal('cancelAnimationFrame', (frame: number) => animationFrames.delete(frame))
+  canvasState.canvas = canvas
   canvasState.error = null
   canvasState.generation = 1
   canvasState.hasFrame = true
@@ -118,6 +121,16 @@ function installProject() {
     canvasGeneration: 1,
     canvasSize: [1000, 1000],
   })
+}
+
+function pageSummaries(ids: string[], layerCount = 1) {
+  return ids.map((id) => ({
+    id,
+    label: id,
+    size: { width: 1000, height: 1000 },
+    source_asset: null,
+    layer_count: layerCount,
+  }))
 }
 
 function renderWorkspace() {
@@ -162,6 +175,78 @@ describe('canvas interaction adapter', () => {
 
     act(() => useKoharuStore.setState({ canvasPage: 'page' }))
     await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledWith(['next']))
+  })
+
+  it('prefetches the neighbour again at a new revision, not on a re-run at the same one', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next']))
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 2))
+      // React Query notifies its observers on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(prefetchCanvasPages).toHaveBeenCalledTimes(1)
+    act(() => {
+      canvasState.canvas = { ...canvas }
+      canvasState.status = 'recovering'
+      useKoharuStore.setState({ canvasSize: [1000, 1000] })
+    })
+    expect(prefetchCanvasPages).toHaveBeenCalledTimes(1)
+    act(() => {
+      canvasState.status = 'ready'
+      queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 3))
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(2))
+
+    act(() => {
+      canvasState.generation = 2
+      useKoharuStore.setState({ canvasGeneration: 2, canvasRevision: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(3))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
+  })
+
+  it('keeps the prefetch direction on a page and follows a changed neighbour', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['first', 'page', 'next']))
+    queryClient.setQueryData(pageKey, { ...queryClient.getQueryData(pageKey)!, id: 'next' })
+    useKoharuStore.setState({ canvasPage: 'next' })
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['page']))
+
+    act(() => {
+      canvasState.generation = 2
+      queryClient.setQueryData(pageKey, { ...queryClient.getQueryData(pageKey)!, id: 'page' })
+      useKoharuStore.setState({ canvasPage: 'page', canvasGeneration: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['first']))
+
+    act(() => {
+      canvasState.generation = 3
+      useKoharuStore.setState({ canvasGeneration: 3, canvasRevision: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(3))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['first'])
+
+    act(() => queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'])))
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(4))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
+  })
+
+  it('prefetches the neighbour again after a superseded prefetch', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next']))
+    prefetchCanvasPages.mockResolvedValueOnce([])
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(1))
+    await act(async () => {})
+
+    act(() => queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 2)))
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(2))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
   })
 
   it('renders an accessible browser canvas and keeps camera updates local', async () => {
