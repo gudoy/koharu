@@ -9,7 +9,7 @@ use std::{
     fmt::{Debug, Formatter},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -40,7 +40,7 @@ const CHAT_TEMPLATE_NAME: &str = "chat";
 
 pub(super) struct Model {
     backend: &'static LlamaBackend,
-    model: LlamaModel,
+    model: Arc<LlamaModel>,
     mtmd: Option<Mutex<MtmdContext>>,
     capabilities: Capabilities,
     eos_token: LlamaToken,
@@ -137,6 +137,7 @@ impl Model {
         let backend = crate::llama_backend().context("llama.cpp backend is not initialized")?;
         let params = model_params(backend, device, &options)?;
         let model = LlamaModel::load_from_file(backend, &model_path, &params)
+            .map(Arc::new)
             .with_context(|| format!("failed to load GGUF model {}", model_path.display()))?;
         ensure!(
             model.has_decoder(),
@@ -255,7 +256,8 @@ impl Model {
             .model
             .new_context(self.backend, context_config.params)
             .context("failed to create llama.cpp context")?;
-        let mut sampler = self.build_sampler(options, json_schema, &prepared.history_tokens)?;
+        let (mut sampler, grammar) =
+            self.build_sampler(options, json_schema, &prepared.history_tokens)?;
 
         let prompt_start = Instant::now();
         let (mut next_token, mut position) = self.prefill(
@@ -303,15 +305,68 @@ impl Model {
                 break;
             }
 
-            let mut batch = LlamaBatch::new(1, 1);
-            batch
-                .add(next_token, position, &[0], true)
-                .context("failed to build generated-token batch")?;
+            // Tokens the grammar forces after `next_token` need no sampling, so
+            // they are decoded together with it instead of one step each.
+            let mut pending = vec![next_token];
+            let forced = grammar.as_ref().map_or_else(Vec::new, |grammar| {
+                grammar
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .compute_ff_tokens()
+            });
+            let mut stopped = false;
+            for token in forced
+                .into_iter()
+                .map(|token| LlamaToken::new(token.cast_signed()))
+            {
+                if generated_tokens >= options.max_tokens || self.should_stop(token) {
+                    break;
+                }
+                sampler.accept(token);
+                let piece = self
+                    .model
+                    .token_to_piece(token, &mut decoder, true, None)
+                    .context("failed to decode forced token")?;
+                text.push_str(&piece);
+                generated_tokens += 1;
+                pending.push(token);
+                if matches!(
+                    on_token(TokenChunk {
+                        token,
+                        piece: &piece,
+                        text: &text,
+                        generated_tokens,
+                    })?,
+                    GenerationControl::Stop
+                ) {
+                    finish_reason = FinishReason::Callback;
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped || generated_tokens >= options.max_tokens {
+                break;
+            }
+
+            let mut batch = LlamaBatch::new(pending.len(), 1);
+            for (offset, token) in pending.iter().enumerate() {
+                let offset = i32::try_from(offset).context("forced token run exceeds i32")?;
+                batch
+                    .add(
+                        *token,
+                        position
+                            .checked_add(offset)
+                            .context("generated position exceeds i32")?,
+                        &[0],
+                        offset + 1 == i32::try_from(pending.len()).unwrap_or(i32::MAX),
+                    )
+                    .context("failed to build generated-token batch")?;
+            }
             context
                 .decode(&mut batch)
                 .context("failed to decode generated token")?;
             position = position
-                .checked_add(1)
+                .checked_add(i32::try_from(pending.len()).context("forced token run exceeds i32")?)
                 .context("generated position exceeds i32")?;
             // llama_sampler_sample applies the chain and accepts the selected token.
             next_token = sampler.sample(&context, -1);
@@ -492,13 +547,16 @@ impl Model {
         Ok((sampler.sample(context, -1), 1))
     }
 
+    /// Builds the sampler chain, and returns the grammar matcher of a
+    /// structured request so generation can read the tokens it forces.
     fn build_sampler(
         &self,
         options: &GenerationOptions,
         json_schema: Option<&serde_json::Value>,
         history_tokens: &[LlamaToken],
-    ) -> Result<LlamaSampler> {
+    ) -> Result<(LlamaSampler, Option<Arc<Mutex<Matcher>>>)> {
         let mut samplers = Vec::new();
+        let mut structured = None;
 
         if let Some(schema) = json_schema {
             let mut schema = schema.clone();
@@ -527,7 +585,9 @@ impl Model {
             let parser = factory
                 .create_parser(grammar)
                 .context("failed to create structured output parser")?;
-            samplers.push(LlamaSampler::from(Matcher::new(Ok(parser))));
+            let matcher = Arc::new(Mutex::new(Matcher::new(Ok(parser))));
+            samplers.push(LlamaSampler::from(Arc::clone(&matcher)));
+            structured = Some(matcher);
         }
 
         let has_repeat =
@@ -552,7 +612,7 @@ impl Model {
 
         if options.temperature <= 0.0 {
             samplers.push(LlamaSampler::greedy());
-            return Ok(LlamaSampler::chain_simple(samplers));
+            return Ok((LlamaSampler::chain_simple(samplers), structured));
         }
         if let Some(top_k) = options.top_k.filter(|value| *value > 0) {
             samplers.push(LlamaSampler::top_k(
@@ -567,7 +627,7 @@ impl Model {
         }
         samplers.push(LlamaSampler::temp(options.temperature));
         samplers.push(LlamaSampler::dist(options.seed));
-        Ok(LlamaSampler::chain_simple(samplers))
+        Ok((LlamaSampler::chain_simple(samplers), structured))
     }
 
     fn should_stop(&self, token: LlamaToken) -> bool {

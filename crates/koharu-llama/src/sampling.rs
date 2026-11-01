@@ -378,7 +378,7 @@ impl LlamaSampler {
     /// generation, and convert that matcher into a sampler with `LlamaSampler::from`.
     #[cfg(feature = "llguidance")]
     #[must_use]
-    pub fn llguidance_tok_env(model: &LlamaModel) -> toktrie::TokEnv {
+    pub fn llguidance_tok_env(model: &std::sync::Arc<LlamaModel>) -> toktrie::TokEnv {
         crate::llguidance_sampler::llguidance_build_tok_env(model)
     }
 
