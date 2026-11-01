@@ -1,4 +1,9 @@
-use std::{collections::HashSet, io::Cursor, path::PathBuf};
+use std::{
+    collections::HashSet,
+    io::Cursor,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, RgbaImage};
@@ -262,7 +267,14 @@ pub(crate) struct Project {
     pub(crate) active_page: Option<EntityId>,
     pub(crate) undo: Vec<Vec<Revision>>,
     pub(crate) redo: Vec<Vec<Revision>>,
+    /// The layer whose text-edit session owns the last undo step and is still
+    /// accepting drafts.
+    text_edit: Option<EntityId>,
+    /// When the oldest draft that is not yet saved was staged.
+    staged: Option<Instant>,
 }
+
+const DRAFT_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Project {
     pub(crate) async fn create(name: String, path: PathBuf) -> Result<Self> {
@@ -287,6 +299,8 @@ impl Project {
             active_page,
             undo: Vec::new(),
             redo: Vec::new(),
+            text_edit: None,
+            staged: None,
         }
     }
 
@@ -481,6 +495,7 @@ impl Project {
         &mut self,
         layer: EntityId,
         text: String,
+        draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -498,13 +513,14 @@ impl Project {
                 },
             )
         })?;
-        self.commit(patch).await
+        self.commit_text(patch, draft).await
     }
 
     pub(crate) async fn set_translation(
         &mut self,
         layer: EntityId,
         text: Option<String>,
+        draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -525,7 +541,32 @@ impl Project {
                 None => edit.remove::<SceneTranslation>(content),
             }
         })?;
-        self.commit(patch).await
+        self.commit_text(patch, draft).await
+    }
+
+    /// A draft previews live typing: it is staged, not saved. The edit that
+    /// ends the session saves the complete state, earlier drafts included. A
+    /// long session also saves its drafts every [`DRAFT_SAVE_INTERVAL`], which
+    /// bounds what a crash loses without adding an undo step.
+    async fn commit_text(&mut self, patch: koharu_scene::Patch, draft: bool) -> Result<Commit> {
+        if draft {
+            let commit = self.session.stage(patch).await?;
+            if self.staged.get_or_insert_with(Instant::now).elapsed() >= DRAFT_SAVE_INTERVAL {
+                // The draft is already applied, so it must still reach the undo
+                // history. A failed save stays due: the next draft retries it,
+                // and the edit that ends the session reports it.
+                match self.session.persist().await {
+                    Ok(()) => self.staged = None,
+                    Err(error) => {
+                        tracing::warn!(error = format!("{error:#}"), "failed to save text drafts")
+                    }
+                }
+            }
+            return Ok(commit);
+        }
+        let commit = self.commit(patch).await?;
+        self.staged = None;
+        Ok(commit)
     }
 
     pub(crate) async fn set_typography(
@@ -873,6 +914,7 @@ impl Project {
     }
 
     pub(crate) async fn undo(&mut self) -> Result<Commit> {
+        self.text_edit = None;
         let revisions = self.undo.pop().ok_or_else(|| anyhow!("nothing to undo"))?;
         let commit = match self.session.undo_many(revisions.iter().copied()).await {
             Ok(commit) => commit,
@@ -886,6 +928,7 @@ impl Project {
     }
 
     pub(crate) async fn redo(&mut self) -> Result<Commit> {
+        self.text_edit = None;
         let revisions = self.redo.pop().ok_or_else(|| anyhow!("nothing to redo"))?;
         let commit = match self.session.undo_many(revisions.iter().copied()).await {
             Ok(commit) => commit,
@@ -902,12 +945,30 @@ impl Project {
         if !revisions.is_empty() {
             self.undo.push(revisions);
             self.redo.clear();
+            self.text_edit = None;
         }
     }
 
     pub(crate) fn record_commit(&mut self, commit: &Commit) {
         if commit.changes.to != commit.changes.from {
             self.record(vec![commit.revision]);
+        }
+    }
+
+    /// Drafts of one layer's text and the edit that ends them share one undo
+    /// step, like a Photoshop text-edit session.
+    pub(crate) fn record_text_edit(&mut self, layer: EntityId, commit: &Commit, draft: bool) {
+        let open = self.text_edit.take() == Some(layer);
+        let changed = commit.changes.to != commit.changes.from;
+        match self.undo.last_mut() {
+            Some(step) if open && changed => {
+                step.push(commit.revision);
+                self.redo.clear();
+            }
+            _ => self.record_commit(commit),
+        }
+        if draft && (open || changed) {
+            self.text_edit = Some(layer);
         }
     }
 
@@ -1508,6 +1569,156 @@ mod tests {
         assert_eq!(erased_layer, layer);
         assert_eq!(pixel(&painted.snapshot).0, [210, 40, 20, 255]);
         assert_eq!(pixel(&erased.snapshot).0[3], 0);
+    }
+
+    #[tokio::test]
+    async fn translation_drafts_and_their_commit_are_one_undo_step() {
+        async fn edit(project: &mut Project, layer: EntityId, text: &str, draft: bool) {
+            let commit = project
+                .set_translation(layer, Some(text.to_owned()), draft)
+                .await
+                .unwrap();
+            project.record_text_edit(layer, &commit, draft);
+        }
+        fn translation(project: &Project, layer: EntityId) -> Option<String> {
+            let snapshot = project.snapshot();
+            let content = Project::text_content(&snapshot, layer).unwrap();
+            snapshot
+                .component::<SceneTranslation>(content)
+                .unwrap()
+                .map(|translation| translation.text.value)
+        }
+
+        let mut session = Session::memory().await.unwrap();
+        let mut setup = session.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+        let (commit, layer) = project
+            .add_point_text(page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        edit(&mut project, layer, "Hello", false).await;
+        let steps = project.undo.len();
+
+        edit(&mut project, layer, "H", true).await;
+        edit(&mut project, layer, "Hi", true).await;
+        edit(&mut project, layer, "Hi there", false).await;
+        assert_eq!(
+            project.undo.len(),
+            steps + 1,
+            "typing with pauses and then leaving the field is one undo step"
+        );
+
+        // A commit that only confirms the last draft still ends the session.
+        edit(&mut project, layer, "Hey", true).await;
+        edit(&mut project, layer, "Hey", false).await;
+        edit(&mut project, layer, "Hey you", true).await;
+        assert_eq!(project.undo.len(), steps + 3);
+
+        project.undo().await.unwrap();
+        project.undo().await.unwrap();
+        assert_eq!(translation(&project, layer).as_deref(), Some("Hi there"));
+        project.undo().await.unwrap();
+        assert_eq!(translation(&project, layer).as_deref(), Some("Hello"));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_confirms_the_last_draft_saves_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("drafts.khrproj");
+        let mut project = Project::create("drafts".to_owned(), path.clone())
+            .await
+            .unwrap();
+        let mut setup = project.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        project
+            .session
+            .commit(setup.finish().unwrap())
+            .await
+            .unwrap();
+        let (_, layer) = project
+            .add_point_text(page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        project
+            .set_translation(layer, Some("Hello".to_owned()), true)
+            .await
+            .unwrap();
+        // Leaving the field resends the previewed text, so this patch is empty.
+        project
+            .set_translation(layer, Some("Hello".to_owned()), false)
+            .await
+            .unwrap();
+        drop(project);
+
+        let project = Project::open("drafts".to_owned(), path).await.unwrap();
+        let snapshot = project.snapshot();
+        let content = Project::text_content(&snapshot, layer).unwrap();
+        let translation = snapshot
+            .component::<SceneTranslation>(content)
+            .unwrap()
+            .map(|translation| translation.text.value);
+        assert_eq!(translation.as_deref(), Some("Hello"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_draft_save_keeps_the_draft_in_its_undo_step() {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+
+        // Like the text-edit commands, records only an edit that returns.
+        async fn edit(project: &mut Project, layer: EntityId, text: &str, draft: bool) {
+            if let Ok(commit) = project
+                .set_translation(layer, Some(text.to_owned()), draft)
+                .await
+            {
+                project.record_text_edit(layer, &commit, draft);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("drafts.khrproj");
+        let mut project = Project::create("drafts".to_owned(), path.clone())
+            .await
+            .unwrap();
+        let mut setup = project.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        project
+            .session
+            .commit(setup.finish().unwrap())
+            .await
+            .unwrap();
+        let (_, layer) = project
+            .add_point_text(page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        edit(&mut project, layer, "Hello", false).await;
+        edit(&mut project, layer, "Hi", true).await;
+
+        // The next draft is due for its periodic save, which the disk refuses.
+        project.staged = Some(Instant::now() - DRAFT_SAVE_INTERVAL);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+        edit(&mut project, layer, "Hi there", true).await;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(project.staged.is_some(), "the refused save stays due");
+        edit(&mut project, layer, "Hi there!", false).await;
+
+        project.undo().await.unwrap();
+        let snapshot = project.snapshot();
+        let content = Project::text_content(&snapshot, layer).unwrap();
+        let translation = snapshot
+            .component::<SceneTranslation>(content)
+            .unwrap()
+            .map(|translation| translation.text.value);
+        assert_eq!(translation.as_deref(), Some("Hello"));
     }
 
     #[test]

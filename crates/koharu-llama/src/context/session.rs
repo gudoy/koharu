@@ -142,7 +142,7 @@ pub enum LoadSessionError {
     },
 }
 
-impl LlamaContext<'_> {
+impl LlamaContext {
     /// Save the current session to a file.
     ///
     /// # Parameters

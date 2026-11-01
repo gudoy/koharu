@@ -91,15 +91,54 @@ mod tests {
 
     use super::KoharuLayoutRFDetrSeg2XL;
 
+    /// Page-pixel bounds on each box edge against the upstream reference.
+    struct EdgeTolerance {
+        bubble: f32,
+        lower_panel: f32,
+        middle_panel: f32,
+    }
+
     #[tokio::test]
     #[ignore = "downloads the checkpoint and requires CUDA"]
     async fn checkpoint_matches_rfdetr_upstream_structured_output() -> Result<()> {
+        assert_matches_upstream(
+            crate::Device::cuda(0),
+            EdgeTolerance {
+                bubble: 6.0,
+                lower_panel: 7.0,
+                middle_panel: 3.0,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the checkpoint and requires an Apple GPU"]
+    async fn checkpoint_matches_rfdetr_upstream_structured_output_on_metal() -> Result<()> {
+        // MPS always runs this model in BF16 with its own kernels, and its panel
+        // edges land up to about 7 px from the CUDA reference. The bubble keeps
+        // the CUDA bound, which decoding boxes in BF16 exceeds.
+        assert_matches_upstream(
+            crate::Device::metal(0),
+            EdgeTolerance {
+                bubble: 6.0,
+                lower_panel: 8.0,
+                middle_panel: 8.0,
+            },
+        )
+        .await
+    }
+
+    async fn assert_matches_upstream(
+        device: crate::Device,
+        tolerance: EdgeTolerance,
+    ) -> Result<()> {
         crate::init().await?;
         let image = image::open(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("benches/fixtures/object_detection/1.jpg"),
         )?;
-        let model = KoharuLayoutRFDetrSeg2XL::load(crate::Device::cuda(0)).await?;
+        let model = KoharuLayoutRFDetrSeg2XL::load(device).await?;
         let result = model.inference(&image)?;
 
         // RF-DETR 4ab7c18, CUDA BF16, shape=(1152, 1152), antialias disabled.
@@ -113,7 +152,10 @@ mod tests {
             .into_iter()
             .zip([566.220_7, 550.019_5, 691.044_9, 724.043])
         {
-            assert!((actual - expected).abs() < 6.0);
+            assert!(
+                (actual - expected).abs() < tolerance.bubble,
+                "bubble edge {actual} vs {expected}"
+            );
         }
         assert!(best.area.abs_diff(18_882) < 100);
 
@@ -134,14 +176,20 @@ mod tests {
             .into_iter()
             .zip([69.179_69, 799.453_1, 700.820_3, 1006.171_9])
         {
-            assert!((actual - expected).abs() < 7.0);
+            assert!(
+                (actual - expected).abs() < tolerance.lower_panel,
+                "lower panel edge {actual} vs {expected}"
+            );
         }
         for (actual, expected) in middle_panel
             .bbox
             .into_iter()
             .zip([70.683_59, 550.546_9, 699.316_4, 782.578_1])
         {
-            assert!((actual - expected).abs() < 3.0);
+            assert!(
+                (actual - expected).abs() < tolerance.middle_panel,
+                "middle panel edge {actual} vs {expected}"
+            );
         }
         assert!(lower_panel.area.abs_diff(136_734) < 1_000);
         assert!(middle_panel.area.abs_diff(142_179) < 2_000);

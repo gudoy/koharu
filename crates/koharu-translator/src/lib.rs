@@ -13,10 +13,11 @@ use std::{sync::Arc, time::Duration};
 
 use koharu_ml::Device;
 
-use error::{Error, Result};
+use error::Result;
 use local::LocalTranslator;
 
 pub use backend::{TranslationContext, TranslationRequest};
+pub use error::Error;
 pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
@@ -96,11 +97,15 @@ impl Translator {
         Ok(())
     }
 
+    /// Translates `request`. Local generation checks `stopped` after every token and a hosted
+    /// request is abandoned once it returns `true`; either way the translation fails with
+    /// [`Error::Stopped`].
     pub async fn translate(
         &self,
         selection: &ModelSelection,
         generation: GenerationConfig,
         mut request: TranslationRequest,
+        stopped: impl Fn() -> bool + Send + Sync + 'static,
     ) -> anyhow::Result<(&'static str, Vec<String>)> {
         let provider = selection.provider;
         let provider_id: &'static str = provider.into();
@@ -120,11 +125,15 @@ impl Translator {
         let translated = if provider == Provider::Local {
             self.local(selection)
                 .await?
-                .translate(request, generation)
+                .translate(request, generation, stopped)
                 .await?
         } else {
             let providers = self.providers.read()?.clone();
-            remote::translate(&self.client, &providers, selection, &generation, &request).await?
+            unless_stopped(
+                remote::translate(&self.client, &providers, selection, &generation, &request),
+                &stopped,
+            )
+            .await?
         };
         if translated.len() != expected {
             return Err(Error::SegmentCount {
@@ -176,9 +185,53 @@ impl Translator {
     }
 }
 
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Abandons a hosted request once `stopped` returns `true`. Dropping it only closes the
+/// connection: a server on this machine, such as Ollama or LM Studio, keeps decoding on the same
+/// accelerator until it aborts on the disconnect. Local generation must observe the stop itself.
+async fn unless_stopped<T>(
+    request: impl Future<Output = Result<T>>,
+    stopped: &impl Fn() -> bool,
+) -> Result<T> {
+    tokio::select! {
+        result = request => result,
+        () = async {
+            while !stopped() {
+                tokio::time::sleep(STOP_POLL_INTERVAL).await;
+            }
+        } => Err(Error::Stopped),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    #[tokio::test]
+    async fn stop_abandons_a_hosted_request() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stop.store(true, Ordering::Release);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            unless_stopped(std::future::pending::<Result<()>>(), &|| {
+                stopped.load(Ordering::Acquire)
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a stopped hosted request kept waiting"
+        );
+    }
 
     fn local_selection(model: &str) -> ModelSelection {
         ModelSelection {

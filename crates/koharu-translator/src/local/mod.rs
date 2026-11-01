@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use koharu_ml::llm::{
-    ChatMessage, ChatTemplateOptions, Input, Llm, LoadOptions, MtmdOptions, media_marker,
+    ChatMessage, ChatTemplateOptions, FinishReason, GenerationControl, Input, Llm, LoadOptions,
+    MtmdOptions, media_marker,
 };
 
 mod catalog;
@@ -57,6 +58,7 @@ impl LocalTranslator {
         &self,
         request: TranslationRequest,
         generation: GenerationConfig,
+        stopped: impl Fn() -> bool + Send + 'static,
     ) -> Result<Vec<String>> {
         let expected = request.segments.len();
         if expected == 0 {
@@ -80,15 +82,28 @@ impl LocalTranslator {
         )?;
         let schema = prompt::output_schema(expected);
         let llm = Arc::clone(&self.llm);
-        let generation = self.descriptor.generation.options(generation);
+        let explicit_limit = generation.max_tokens.is_some();
+        let mut generation = self.descriptor.generation.options(generation);
+        if !explicit_limit {
+            generation.max_tokens = generation.max_tokens.max(output_budget(&request.segments));
+        }
         let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
-            llm.inference_with_json_schema(&input, &generation, &schema)
+            llm.inference_with_json_schema(&input, &generation, &schema, |_| {
+                Ok(if stopped() {
+                    GenerationControl::Stop
+                } else {
+                    GenerationControl::Continue
+                })
+            })
         })
         .await?;
+        if output.finish_reason == FinishReason::Callback {
+            return Err(Error::Stopped);
+        }
         let segments = prompt::translations("local", &output.text, &request.segments)?;
         Ok(segments)
     }
@@ -111,6 +126,22 @@ impl LocalTranslator {
             )
             .context("failed to render local translation prompt")?)
     }
+}
+
+/// Output tokens the schema's JSON object around one translated segment costs.
+const SEGMENT_OVERHEAD_TOKENS: usize = 16;
+
+/// The catalog token limit fits an ordinary page, but the schema forces one
+/// entry per segment and a response cut at the limit is invalid JSON, so a
+/// page with many or long segments needs a larger limit. Source UTF-8 bytes
+/// stand in for the model's token count: a CJK character is three bytes and
+/// translates to one or two tokens, while Latin text takes about one token per
+/// four bytes.
+fn output_budget(segments: &[String]) -> usize {
+    segments
+        .iter()
+        .map(|segment| SEGMENT_OVERHEAD_TOKENS + segment.len() / 2)
+        .sum()
 }
 
 pub(crate) fn models() -> Vec<Model> {

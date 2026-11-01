@@ -64,6 +64,14 @@ pub enum JobState {
     Stopped,
 }
 
+/// How a pipeline job ended. A job whose failures stayed confined to their
+/// pages is `Failed` with `failed_pages > 0`; every other page was processed.
+pub(crate) struct JobEnd {
+    pub(crate) state: JobState,
+    pub(crate) error: Option<String>,
+    pub(crate) failed_pages: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct Processing {
     pub(crate) stops: Mutex<HashMap<JobId, StopToken>>,
@@ -114,7 +122,7 @@ pub(crate) async fn start(
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
     inpainting_mask: Option<koharu_pipeline::InpaintingMask>,
-) -> Result<(JobId, JoinHandle<(JobState, Option<String>)>)> {
+) -> Result<(JobId, JoinHandle<JobEnd>)> {
     let project = handle.state::<CurrentProject>();
     let processing = handle.state::<Processing>();
     let job_channel = handle.state::<JobChannel>();
@@ -164,26 +172,36 @@ pub(crate) async fn start(
             inpainting_mask,
         };
         request.progress = Some(Arc::new(move |event| {
+            // Stage tasks emit concurrently with the run loop. Hold the counter until the job is
+            // written and published so an older count never replaces a newer one.
+            let mut progress = progress.lock();
             let update = match event {
                 Progress::Started { pages, stages } => {
-                    let mut progress = progress.lock();
                     *progress = (0, pages.len().saturating_mul(stages.len()));
                     Some((0, progress.1, None, None, None))
                 }
                 Progress::Loading { page, stage, model } => {
-                    let progress = progress.lock();
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Finished {
                     page, stage, model, ..
                 } => {
-                    let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Skipped { page, stage } => {
-                    let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
+                    Some((progress.0, progress.1, Some(page), Some(stage), None))
+                }
+                Progress::Failed {
+                    page,
+                    stage,
+                    abandoned,
+                } => {
+                    progress.0 = progress
+                        .0
+                        .saturating_add(1 + abandoned.len())
+                        .min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), None))
                 }
                 Progress::Running { .. } => None,
@@ -276,16 +294,43 @@ pub(crate) async fn start(
             }
             Ok::<_, anyhow::Error>(Some(snapshot))
         };
-        let (stopped, error) = match ready.await {
-            Ok(None) => (true, None),
-            Err(error) => (false, Some(format!("{error:#}"))),
+        let (stopped, error, failed_pages) = match ready.await {
+            Ok(None) => (true, None, 0),
+            Err(error) => (false, Some(format!("{error:#}")), 0),
             Ok(Some(snapshot)) => {
+                let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
                 let pipeline = task_handle.state::<koharu_pipeline::Pipeline>();
                 match pipeline.execute(snapshot, request, &mut committer).await {
-                    Ok(report) => (report.status == RunStatus::Stopped, None),
+                    Ok(report) => {
+                        let error = (!report.failures.is_empty()).then(|| {
+                            report
+                                .failures
+                                .iter()
+                                .map(|failure| {
+                                    let number = pages
+                                        .iter()
+                                        .position(|page| *page == failure.page)
+                                        .map_or_else(
+                                            || failure.page.to_string(),
+                                            |index| (index + 1).to_string(),
+                                        );
+                                    format!("page {number}: {:#}", failure.error)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        });
+                        if let Some(error) = &error {
+                            tracing::error!(pages = report.failures.len(), %error, "processing failed on some pages");
+                        }
+                        (
+                            report.status == RunStatus::Stopped,
+                            error,
+                            report.failures.len(),
+                        )
+                    }
                     Err(error) => {
                         tracing::error!(stage = ?error.stage, %error, "processing failed");
-                        (false, Some(format!("{error:#}")))
+                        (false, Some(format!("{error:#}")), 0)
                     }
                 }
             }
@@ -311,7 +356,11 @@ pub(crate) async fn start(
         if let Some(job) = job {
             task_handle.state::<JobChannel>().channel.publish(job);
         }
-        (state, error)
+        JobEnd {
+            state,
+            error,
+            failed_pages,
+        }
     });
     Ok((id, task))
 }

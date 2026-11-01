@@ -161,8 +161,9 @@ mod tests {
                 notified += 1;
             }
         }
+        // The first sample always differs from the default snapshot.
         assert!(
-            notified <= 3,
+            (1..=3).contains(&notified),
             "{notified} of 10 samples notified subscribers"
         );
     }

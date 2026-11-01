@@ -142,6 +142,14 @@ impl LlamaContextParams {
         self.context_params.n_rs_seq
     }
 
+    /// Set the maximum number of outputs in a micro-batch (0 = `n_batch`). llama.cpp reserves
+    /// this many rows of logits and asserts when a batch requests more.
+    #[must_use]
+    pub fn with_n_outputs_max(mut self, n_outputs_max: u32) -> Self {
+        self.context_params.n_outputs_max = n_outputs_max;
+        self
+    }
+
     /// Set the llama.cpp context type.
     #[must_use]
     pub fn with_context_type(mut self, context_type: LlamaContextType) -> Self {

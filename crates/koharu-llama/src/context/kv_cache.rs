@@ -22,7 +22,7 @@ pub enum KvCacheConversionError {
     PartialSequenceRemovalFailed(i32, i32),
 }
 
-impl LlamaContext<'_> {
+impl LlamaContext {
     /// Copy the cache from one sequence to another.
     ///
     /// # Parameters

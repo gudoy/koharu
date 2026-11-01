@@ -10,7 +10,14 @@ import { Updater } from '@/components/app/Updater'
 import ClientOnly from '@/components/ClientOnly'
 import { refreshTranslationModels } from '@/lib/backend'
 import i18n from '@/lib/i18n'
-import { pageKey, pagesKey, projectKey, queryClient, refresh } from '@/lib/queries'
+import {
+  createJobRefresh,
+  pageKey,
+  pagesKey,
+  projectKey,
+  queryClient,
+  refresh,
+} from '@/lib/queries'
 import {
   receiveCanvas,
   receiveDownload,
@@ -38,7 +45,7 @@ export function Providers({ children }: { children: ReactNode }) {
     lifecycle.active = true
     if (!lifecycle.bound) {
       lifecycle.bound = true
-      const completed = new Map<string, number>()
+      const refreshForJob = createJobRefresh()
       const channel = <T,>(receive: (value: T) => void) =>
         new Channel<T>((value) => {
           if (lifecycle.active) receive(value)
@@ -50,12 +57,8 @@ export function Providers({ children }: { children: ReactNode }) {
         .subscribe(
           channel<CanvasState>(receiveCanvas),
           channel<Job>((job) => {
-            const previous = completed.get(job.id) ?? 0
-            completed.set(job.id, job.completed)
             receiveJob(job)
-            if (job.completed > previous || (job.state !== 'running' && job.state !== 'waiting')) {
-              void refresh(projectKey, pagesKey, pageKey).catch(() => undefined)
-            }
+            refreshForJob(job)
           }),
           channel<Download>(receiveDownload),
           channel<ModelResources>(receiveResources),

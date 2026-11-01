@@ -84,6 +84,9 @@ struct GpuState {
     renderer: vello::Renderer,
     compositor: GpuCompositor,
     targets: Vec<RenderTarget>,
+    /// Bumped by `clear_resources`; a readback returns its target to the pool only
+    /// when no clear happened while the target was out.
+    generation: u64,
 }
 
 struct RenderTarget {
@@ -123,8 +126,17 @@ impl Rasterizer {
                 renderer,
                 compositor,
                 targets: Vec::new(),
+                generation: 0,
             }),
         })
+    }
+
+    /// Releases cached raster tiles and pooled readback targets.
+    pub fn clear_resources(&self) {
+        let mut gpu = self.gpu.lock();
+        gpu.compositor.clear_resources();
+        gpu.targets.clear();
+        gpu.generation += 1;
     }
 
     pub fn rasterize(&self, frame: &Frame, options: RasterOptions) -> Result<Raster> {
@@ -263,7 +275,7 @@ impl Rasterizer {
             height,
             depth_or_array_layers: 1,
         };
-        let (device, submission, target) = {
+        let (device, submission, target, generation) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
                 device,
@@ -271,6 +283,7 @@ impl Rasterizer {
                 renderer,
                 compositor,
                 targets,
+                generation,
             } = &mut *gpu;
             let device = device.clone();
             check_device_limit(&device, width, height)?;
@@ -304,10 +317,10 @@ impl Rasterizer {
                 size,
             );
             let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
+            (device, submission, target, *generation)
         };
         // Compositor targets are premultiplied; native images expose straight RGBA.
-        self.finish_readback(device, submission, target, true)
+        self.finish_readback(device, submission, target, generation, true)
     }
 
     fn readback_scene(
@@ -322,7 +335,7 @@ impl Rasterizer {
             height,
             depth_or_array_layers: 1,
         };
-        let (device, submission, target) = {
+        let (device, submission, target, generation) = {
             let mut gpu = self.gpu.lock();
             let GpuState {
                 device,
@@ -330,6 +343,7 @@ impl Rasterizer {
                 renderer,
                 compositor: _,
                 targets,
+                generation,
             } = &mut *gpu;
             let device = device.clone();
             check_device_limit(&device, width, height)?;
@@ -364,9 +378,9 @@ impl Rasterizer {
                 size,
             );
             let submission = queue.submit([encoder.finish()]);
-            (device, submission, target)
+            (device, submission, target, *generation)
         };
-        self.finish_readback(device, submission, target, false)
+        self.finish_readback(device, submission, target, generation, false)
     }
 
     fn finish_readback(
@@ -374,6 +388,7 @@ impl Rasterizer {
         device: wgpu::Device,
         submission: wgpu::SubmissionIndex,
         target: RenderTarget,
+        generation: u64,
         premultiplied: bool,
     ) -> AnyResult<Vec<u8>> {
         let width = target.width;
@@ -423,7 +438,7 @@ impl Rasterizer {
         drop(mapped);
         target.readback.unmap();
         let mut gpu = self.gpu.lock();
-        if gpu.targets.len() < 4 {
+        if gpu.generation == generation && gpu.targets.len() < 4 {
             gpu.targets.push(target);
         }
         Ok(pixels)
@@ -561,4 +576,109 @@ fn finish_raster(
 
 fn rgba([r, g, b, a]: [u8; 4]) -> Color {
     Color::from_rgba8(r, g, b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use super::*;
+    use crate::{
+        Bounds, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
+        PreparedLayer, PreparedRaster, PreparedRasterTile, PreparedResource, Presentation,
+        Revision,
+    };
+
+    #[test]
+    fn clearing_resources_releases_cached_tiles_and_targets() {
+        let resource =
+            PreparedResource::encoded_raster(2, 1, "image/png", Arc::from(&b"tile"[..])).unwrap();
+        let source = resource.id();
+        let bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 1.0,
+        };
+        let frame = PreparedFrameBundle {
+            frame: PreparedFrame {
+                revision: Revision::new(1),
+                page: LayerId::from_bytes([1; 16]),
+                width: 2,
+                height: 1,
+                origin: (0, 0),
+                normalization: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                layers: vec![PreparedLayer {
+                    id: LayerId::from_bytes([2; 16]),
+                    geometry: vec![
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 2.0, y: 0.0 },
+                        Point { x: 2.0, y: 1.0 },
+                        Point { x: 0.0, y: 1.0 },
+                    ],
+                    bounds,
+                    local_bounds: bounds,
+                    presentation: Presentation {
+                        visible: true,
+                        opacity: 1.0,
+                    },
+                    kind: LayerKind::Raster,
+                    placement: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    content: PreparedContent::Raster(PreparedRaster {
+                        source,
+                        width: 2,
+                        height: 1,
+                        tiles: vec![PreparedRasterTile {
+                            x: 0,
+                            y: 0,
+                            width: 2,
+                            height: 1,
+                            gutter: [0; 4],
+                        }],
+                    }),
+                    element_frame: None,
+                }],
+            },
+            resources: vec![resource],
+        }
+        .into_frame_with_raster_sources(&HashMap::from([(source, Arc::from(&[255; 8][..]))]))
+        .unwrap();
+        let rasterizer = Rasterizer::new().unwrap();
+        rasterizer
+            .rasterize(&frame, RasterOptions::default())
+            .unwrap();
+        {
+            let gpu = rasterizer.gpu.lock();
+            assert_eq!(gpu.compositor.cached_resource_count(), 1);
+            assert_eq!(gpu.targets.len(), 1);
+        }
+
+        rasterizer.clear_resources();
+
+        let gpu = rasterizer.gpu.lock();
+        assert_eq!(gpu.compositor.cached_resource_count(), 0);
+        assert!(gpu.targets.is_empty());
+    }
+
+    #[test]
+    fn clearing_resources_drops_targets_of_inflight_readbacks() {
+        let rasterizer = Rasterizer::new().unwrap();
+        let (device, submission, target, generation) = {
+            let mut gpu = rasterizer.gpu.lock();
+            let device = gpu.device.clone();
+            let target = take_target(&mut gpu.targets, &device, 2, 1).unwrap();
+            let submission = gpu.queue.submit([]);
+            (device, submission, target, gpu.generation)
+        };
+
+        rasterizer.clear_resources();
+        rasterizer
+            .finish_readback(device, submission, target, generation, false)
+            .unwrap();
+
+        assert!(
+            rasterizer.gpu.lock().targets.is_empty(),
+            "a target taken before clearing must not return to the pool"
+        );
+    }
 }

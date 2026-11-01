@@ -85,6 +85,117 @@ async fn stop_after_a_page_keeps_completed_progress() {
     assert_eq!(report.total, 2);
 }
 
+/// Fails every stage on one page and finds nothing to do on the others.
+struct FailingPage {
+    page: koharu_scene::EntityId,
+    snapshot: koharu_scene::Snapshot,
+}
+
+#[async_trait::async_trait]
+impl stages::StageProcessor for FailingPage {
+    fn model(&self) -> &'static str {
+        "failing-page"
+    }
+
+    fn unload(&self) -> bool {
+        false
+    }
+
+    async fn load(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn process(&self, input: stages::StageInput) -> anyhow::Result<koharu_scene::Patch> {
+        anyhow::ensure!(input.page() != self.page, "model returned invalid output");
+        Ok(self.snapshot.patch(|_| Ok(()))?)
+    }
+}
+
+#[tokio::test]
+async fn a_page_failure_does_not_stop_the_other_pages() {
+    let mut session = koharu_scene::Session::memory().await.unwrap();
+    let mut pages = Vec::new();
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            for name in ["one", "two"] {
+                pages.push(edit.add_page(
+                    koharu_scene::PageDraft::new(name, 1.0, 1.0),
+                    koharu_scene::At::End,
+                )?);
+            }
+            Ok(())
+        })
+        .unwrap();
+    session.commit(patch).await.unwrap();
+    let snapshot = session.snapshot();
+
+    let device = koharu_ml::Device::cpu();
+    let translator = koharu_translator::Translator::from_config(
+        device.clone(),
+        koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
+    )
+    .unwrap();
+    let resources = resources::ResourceMonitor::new(&device);
+    let mut runner = stage_runner::StageRunner::new(
+        &PipelineConfig::default(),
+        translator,
+        &device,
+        resources.clone(),
+    )
+    .unwrap();
+    runner.set_test_processor(std::sync::Arc::new(FailingPage {
+        page: pages[0],
+        snapshot: snapshot.clone(),
+    }));
+    let failed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events = failed.clone();
+    let request = Request {
+        operation: Operation::Through {
+            stage: Stage::Translation,
+        },
+        progress: Some(std::sync::Arc::new(move |event| {
+            if let Progress::Failed {
+                page,
+                stage,
+                abandoned,
+            } = event
+            {
+                events.lock().unwrap().push((page, stage, abandoned));
+            }
+        })),
+        ..Request::default()
+    };
+    let mut committer = RejectCommitter;
+
+    let report = execution::Execution::new(
+        std::sync::Arc::new(runner),
+        resources,
+        snapshot,
+        request,
+        &mut committer,
+    )
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+
+    assert_eq!(report.status, RunStatus::Completed);
+    assert_eq!(report.completed, 3);
+    assert_eq!(report.total, 6);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].page, pages[0]);
+    assert_eq!(report.failures[0].error.stage, Some(Stage::Detection));
+    assert_eq!(
+        *failed.lock().unwrap(),
+        [(
+            pages[0],
+            Stage::Detection,
+            vec![Stage::Ocr, Stage::Translation]
+        )]
+    );
+}
+
 struct RejectCommitter;
 
 fn pipeline(translation: TranslationConfig) -> Pipeline {

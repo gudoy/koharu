@@ -181,6 +181,15 @@ impl KoharuHost {
             "completed": report.completed,
             "total": report.total,
             "elapsed_ms": report.elapsed.as_millis(),
+            "failures": report
+                .failures
+                .iter()
+                .map(|failure| json!({
+                    "page": failure.page,
+                    "stage": failure.error.stage,
+                    "error": format!("{:#}", failure.error),
+                }))
+                .collect::<Vec<_>>(),
         }))
     }
 }
@@ -331,7 +340,9 @@ impl Host for KoharuHost {
                 self.mutate(|project| {
                     Box::pin(async move {
                         Ok((
-                            project.set_source_text(element, arguments.text).await?,
+                            project
+                                .set_source_text(element, arguments.text, false)
+                                .await?,
                             json!({ "element": element }),
                         ))
                     })
@@ -344,7 +355,9 @@ impl Host for KoharuHost {
                 self.mutate(|project| {
                     Box::pin(async move {
                         Ok((
-                            project.set_translation(element, arguments.text).await?,
+                            project
+                                .set_translation(element, arguments.text, false)
+                                .await?,
                             json!({ "element": element }),
                         ))
                     })

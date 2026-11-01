@@ -126,9 +126,48 @@ pub struct ModelResources {
     pub devices: Vec<DeviceResources>,
 }
 
+/// Owns the resource subscriber and the last sample forwarded to it. The
+/// subscriber can arrive before the pipeline exists, so it never reads the
+/// pipeline's monitor directly.
 #[derive(Default)]
 pub(crate) struct ResourceChannel {
-    pub(crate) channel: Mutex<Option<Channel<ModelResources>>>,
+    subscription: Mutex<ResourceSubscription>,
+}
+
+#[derive(Default)]
+struct ResourceSubscription {
+    channel: Option<Channel<ModelResources>>,
+    latest: Option<ModelResources>,
+}
+
+impl ResourceChannel {
+    /// Records `resources` as the latest sample and forwards it.
+    pub(crate) fn publish(&self, resources: ModelResources) {
+        let mut subscription = self.subscription.lock();
+        if subscription
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.send(resources.clone()).is_err())
+        {
+            subscription.channel = None;
+        }
+        subscription.latest = Some(resources);
+    }
+
+    /// Replaces the subscriber and sends it the latest sample. Samples are
+    /// published only when they change, so a new subscriber would otherwise
+    /// see nothing until the next change. Sending under the lock keeps a newer
+    /// sample from being forwarded before this one.
+    fn replace(&self, channel: Channel<ModelResources>) {
+        let mut subscription = self.subscription.lock();
+        if let Some(latest) = &subscription.latest
+            && channel.send(latest.clone()).is_err()
+        {
+            subscription.channel = None;
+            return;
+        }
+        subscription.channel = Some(channel);
+    }
 }
 
 #[derive(Default)]
@@ -181,7 +220,7 @@ pub(crate) async fn subscribe(
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);
-    *handle.state::<ResourceChannel>().channel.lock() = Some(on_resources);
+    handle.state::<ResourceChannel>().replace(on_resources);
     *handle.state::<ProjectChannel>().channel.lock() = Some(on_project);
 
     let canvas = handle.state::<Desktop>().canvas_state();
@@ -212,6 +251,9 @@ pub(crate) async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Proj
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
+        if let Some(previous) = current.as_mut() {
+            previous.session.persist().await?;
+        }
         current.replace(opened)
     };
 
@@ -334,6 +376,9 @@ async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
+        if let Some(previous) = current.as_mut() {
+            previous.session.persist().await?;
+        }
         current.take()
     };
     let desktop = handle.state::<Desktop>();
@@ -487,8 +532,9 @@ mod tests {
     use std::time::Duration;
 
     use koharu_pipeline::StopToken;
+    use tauri::ipc::{Channel, InvokeResponseBody};
 
-    use super::Initialization;
+    use super::{Initialization, ModelResources, ResourceChannel};
 
     #[tokio::test]
     async fn processing_waits_for_the_runtime_unless_stopped() {
@@ -534,5 +580,28 @@ mod tests {
         .expect("a failed runtime must not be waited for")
         .unwrap_err();
         assert!(format!("{error:#}").contains("runtime download failed"));
+    }
+
+    #[test]
+    fn a_new_subscriber_receives_the_latest_sample() {
+        let resources = ResourceChannel::default();
+        resources.publish(ModelResources {
+            system_memory: 1024,
+            ..Default::default()
+        });
+        let (sender, received) = std::sync::mpsc::channel();
+        let subscriber = Channel::<ModelResources>::new(move |body| {
+            if let InvokeResponseBody::Json(json) = body {
+                sender.send(json).unwrap();
+            }
+            Ok(())
+        });
+
+        resources.replace(subscriber);
+
+        let received = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(received.len(), 1, "received {received:?}");
+        let resources = serde_json::from_str::<serde_json::Value>(&received[0]).unwrap();
+        assert_eq!(resources["system_memory"], 1024);
     }
 }

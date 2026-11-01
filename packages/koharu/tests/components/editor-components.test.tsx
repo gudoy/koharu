@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { TitleBar } from '@/components/app/TitleBar'
 import { WindowControls } from '@/components/app/WindowChrome'
+import { ModelPicker } from '@/components/controls/ModelPicker'
 import { ActivityCenter } from '@/components/editor/ActivityCenter'
 import { CanvasCommandBar } from '@/components/editor/CanvasCommandBar'
 import { Inspector } from '@/components/editor/Inspector'
@@ -942,7 +943,49 @@ describe('greenfield editor', () => {
     const source = screen.getByTestId('edit-source-element')
     fireEvent.change(source, { target: { value: 'corrected OCR' } })
     fireEvent.blur(source)
-    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'corrected OCR'))
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'corrected OCR', false))
+  })
+
+  it('previews translation typing and commits the edit once when focus leaves the field', async () => {
+    vi.useFakeTimers()
+    try {
+      installProject()
+      const save = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+      render(<Inspector />)
+      const translation = screen.getByTestId('edit-translation-element')
+      for (const value of ['Hello t', 'Hello th', 'Hello there']) {
+        fireEvent.change(translation, { target: { value } })
+        act(() => vi.advanceTimersByTime(400))
+      }
+      fireEvent.blur(translation)
+      await act(() => vi.runAllTimersAsync())
+
+      expect(save.mock.calls.filter(([, , draft]) => !draft)).toEqual([
+        ['element', 'Hello there', false],
+      ])
+      expect(save.mock.calls.filter(([, , draft]) => draft)).toEqual([
+        ['element', 'Hello t', true],
+        ['element', 'Hello th', true],
+        ['element', 'Hello there', true],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('commits an unfinished translation edit on Mod+Enter and when the field unmounts', async () => {
+    installProject()
+    const save = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+    const { unmount } = render(<Inspector />)
+    const translation = screen.getByTestId('edit-translation-element')
+    fireEvent.change(translation, { target: { value: 'Hello there' } })
+    fireEvent.keyDown(translation, { key: 'Enter', metaKey: true })
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'Hello there', false))
+
+    fireEvent.change(translation, { target: { value: 'Hello again' } })
+    unmount()
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'Hello again', false))
+    expect(save).toHaveBeenCalledTimes(2)
   })
 
   it('shows actual layers with only the useful text-role distinction', () => {
@@ -1366,6 +1409,61 @@ describe('greenfield editor', () => {
     expect(useKoharuStore.getState().preferences?.pipeline.translation).toEqual(
       nextPreferences.pipeline.translation,
     )
+  })
+
+  it('mounts only the visible rows of a large model catalogue', () => {
+    const models = Array.from({ length: 500 }, (_, index) => ({
+      provider: 'openrouter' as const,
+      model: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      quantizations:
+        index === 499
+          ? [
+              { id: 'q4', name: 'Q4_K_M', downloaded: false },
+              { id: 'q8', name: 'Q8_0', downloaded: true },
+            ]
+          : [],
+      vision: false,
+      reasoning: false,
+    }))
+    const onSelect = vi.fn()
+    render(
+      <ModelPicker
+        value={null}
+        models={models}
+        providers={preferences.providers.entries}
+        onBack={() => undefined}
+        onSelect={onSelect}
+      />,
+    )
+
+    const rows = () => screen.getAllByRole('button', { name: /^Use Model \d+ from/ })
+    expect(rows().length).toBeLessThanOrEqual(40)
+
+    // jsdom has no layout and does not clamp scrollTop, so scrolling by the full
+    // list height lands the window on the last rows.
+    const viewport = rows()[0]!.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')!
+    const list = rows()[0]!.parentElement!.parentElement!
+    fireEvent.scroll(viewport, { target: { scrollTop: parseFloat(list.style.height) } })
+    expect(screen.queryByRole('button', { name: /^Use Model 0 from/ })).toBeNull()
+    expect(rows().length).toBeLessThanOrEqual(40)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 498 from/ }))
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'vendor/model-498', quantization: null }),
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 49' },
+    })
+    expect(screen.getByRole('button', { name: /^Use Model 499 from/ })).toBeInTheDocument()
+    for (const row of rows()) expect(row).toHaveAccessibleName(/^Use Model 49\d? from/)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 499' },
+    })
+    expect(screen.getAllByRole('button', { name: /^Use Model \d+ from/ })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 499 from/ }))
+    expect(screen.getByRole('button', { name: 'Q4_K_M' })).toHaveFocus()
   })
 
   it('constrains long model names inside the runtime selector', async () => {

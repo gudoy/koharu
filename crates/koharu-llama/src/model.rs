@@ -5,6 +5,7 @@ use std::os::raw::c_int;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::str::Utf8Error;
+use std::sync::Arc;
 
 use crate::context::LlamaContext;
 use crate::context::params::LlamaContextParams;
@@ -820,48 +821,62 @@ impl LlamaModel {
         })
     }
 
-    /// Create a new context from this model.
+    /// Create a new context from this model. The context keeps the model alive.
     ///
     /// # Errors
     ///
     /// There is many ways this can fail. See [`LlamaContextLoadError`] for more information.
     // we intentionally do not derive Copy on `LlamaContextParams` to allow llama.cpp to change the type to be non-trivially copyable.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_context<'a>(
-        &'a self,
+    pub fn new_context(
+        self: &Arc<Self>,
         _: &LlamaBackend,
         params: LlamaContextParams,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+    ) -> Result<LlamaContext, LlamaContextLoadError> {
         let context_params = params.context_params;
         let context = unsafe {
             koharu_llama_sys::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        Ok(LlamaContext::new(
+            Arc::clone(self),
+            context,
+            params.embeddings(),
+        ))
     }
 
     /// Create a new context bound to another context via llama.cpp's `ctx_other` field.
     ///
     /// This is required for MTP speculative decoding when the draft context shares target state.
     ///
+    /// # Safety
+    ///
+    /// Depending on the architecture, llama.cpp shares `ctx_other`'s memory module with the new
+    /// context. The caller must keep `ctx_other` alive for as long as the new context, and must
+    /// not use the two contexts from different threads at the same time.
+    ///
     /// # Errors
     ///
     /// See [`LlamaContextLoadError`].
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_context_with_ctx_other<'a>(
-        &'a self,
+    pub unsafe fn new_context_with_ctx_other(
+        self: &Arc<Self>,
         _: &LlamaBackend,
         params: LlamaContextParams,
-        ctx_other: &LlamaContext<'_>,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+        ctx_other: &LlamaContext,
+    ) -> Result<LlamaContext, LlamaContextLoadError> {
         let mut context_params = params.context_params;
         context_params.ctx_other = ctx_other.context.as_ptr();
         let context = unsafe {
             koharu_llama_sys::llama_new_context_with_model(self.model.as_ptr(), context_params)
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
-        Ok(LlamaContext::new(self, context, params.embeddings()))
+        Ok(LlamaContext::new(
+            Arc::clone(self),
+            context,
+            params.embeddings(),
+        ))
     }
 
     /// Creates a context with backend sampler chains attached to specific sequences.
@@ -873,12 +888,12 @@ impl LlamaModel {
     ///
     /// See [`LlamaContextLoadError`].
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_context_with_samplers<'a>(
-        &'a self,
+    pub fn new_context_with_samplers(
+        self: &Arc<Self>,
         _: &LlamaBackend,
         params: LlamaContextParams,
         samplers: impl IntoIterator<Item = (i32, LlamaSampler)>,
-    ) -> Result<LlamaContext<'a>, LlamaContextLoadError> {
+    ) -> Result<LlamaContext, LlamaContextLoadError> {
         let samplers = samplers.into_iter().collect::<Vec<_>>();
         let mut context_params = params.context_params;
         let mut sampler_configs = samplers
@@ -899,7 +914,7 @@ impl LlamaModel {
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
         Ok(LlamaContext::with_samplers(
-            self,
+            Arc::clone(self),
             context,
             params.embeddings(),
             samplers,

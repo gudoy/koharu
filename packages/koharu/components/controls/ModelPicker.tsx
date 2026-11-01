@@ -1,11 +1,17 @@
 'use client'
 
+import { measureElement, observeElementRect, useVirtualizer } from '@tanstack/react-virtual'
 import { Check, ChevronLeft, ChevronRight, HardDrive, LoaderCircle, Search, X } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { modelKey, modelSelection, providerName } from '@/lib/translation'
-import type { Model, ModelSelection, ProviderPreference } from '@koharu/bridge/protocol'
+import type {
+  Model,
+  ModelSelection,
+  ProviderPreference,
+  Quantization,
+} from '@koharu/bridge/protocol'
 import { Button } from '@koharu/ui/components/button'
 import {
   InputGroup,
@@ -14,6 +20,9 @@ import {
   InputGroupInput,
 } from '@koharu/ui/components/input-group'
 import { ScrollArea } from '@koharu/ui/components/scroll-area'
+
+const rowHeight = 38
+const listHeight = 256
 
 export function ModelPicker({
   value,
@@ -38,7 +47,6 @@ export function ModelPicker({
   const [query, setQuery] = useState('')
   const [pendingKey, setPendingKey] = useState<string | null>(null)
   const pendingModel = models.find((model) => modelKey(model) === pendingKey)
-  const selectedKey = value ? modelKey(value) : null
   const saving = Boolean(busyModel)
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const options = pendingModel
@@ -103,76 +111,156 @@ export function ModelPicker({
         </div>
       )}
 
-      <ScrollArea
+      <ModelList
         key={pendingKey}
-        className='max-h-64 min-w-0 overflow-hidden'
-        viewportClassName='h-auto max-h-64 min-w-0 overscroll-contain'
-      >
-        <div className='grid min-w-0 gap-0.5 py-0.5'>
-          {options.map(({ model, quantization }, index) => {
-            const key = modelKey(model)
-            const expandable = !quantization && model.quantizations.length > 0
-            const downloaded =
-              quantization?.downloaded ??
-              model.quantizations.some((candidate) => candidate.downloaded)
-            const selected =
-              key === selectedKey &&
-              (!quantization ||
-                quantization.id === (value?.quantization ?? model.quantizations[0]?.id))
-            const provider = providerName(providers, model.provider)
-            return (
-              <Button
-                key={quantization?.id ?? key}
-                autoFocus={Boolean(quantization) && index === 0}
-                type='button'
-                variant='ghost'
-                aria-label={
-                  quantization
-                    ? undefined
-                    : t('modelPicker.useModel', { model: model.name, provider })
-                }
-                aria-pressed={selected}
-                disabled={disabled || saving}
-                className='h-auto min-h-9 w-full max-w-full min-w-0 justify-start gap-2 overflow-hidden rounded-lg px-2 py-1 text-left font-normal hover:bg-primary/10'
-                onClick={() => {
-                  if (expandable) setPendingKey(key)
-                  else onSelect(modelSelection(model, quantization?.id ?? null))
-                }}
-              >
-                <span className='min-w-0 flex-1 overflow-hidden'>
-                  <span className='block truncate text-[11px] text-foreground'>
-                    {quantization?.name ?? model.name}
-                  </span>
-                  {!quantization && (
-                    <span className='block truncate text-[9px] text-muted-foreground'>
-                      {provider}
-                    </span>
-                  )}
-                </span>
-                {downloaded && <HardDrive className='size-3.5 shrink-0 text-muted-foreground' />}
-                {!quantization && busyModel === key ? (
-                  <LoaderCircle className='size-3.5 shrink-0 animate-spin text-primary' />
-                ) : (
-                  selected && <Check className='size-3.5 shrink-0 text-primary' />
-                )}
-                {expandable && <ChevronRight className='size-3.5 shrink-0 text-muted-foreground' />}
-              </Button>
-            )
-          })}
-          {options.length === 0 && (
-            <div className='flex items-center justify-center gap-2 px-2.5 py-5 text-center text-[11px] text-muted-foreground'>
-              {loading && models.length === 0 && <LoaderCircle className='size-3.5 animate-spin' />}
-              {t(
-                models.length > 0
-                  ? 'modelPicker.noResults'
-                  : loading
-                    ? 'modelPicker.loading'
-                    : 'modelPicker.empty',
-              )}
-            </div>
-          )}
-        </div>
-      </ScrollArea>
+        options={options}
+        value={value}
+        providers={providers}
+        loading={loading}
+        modelCount={models.length}
+        disabled={disabled || saving}
+        busyModel={busyModel}
+        onExpand={setPendingKey}
+        onSelect={onSelect}
+      />
     </div>
+  )
+}
+
+// Keyed by the expanded model, so each list starts with its own scroll offset and focus.
+function ModelList({
+  options,
+  value,
+  providers,
+  loading,
+  modelCount,
+  disabled,
+  busyModel,
+  onExpand,
+  onSelect,
+}: {
+  options: { model: Model; quantization: Quantization | null }[]
+  value: ModelSelection | null
+  providers: ProviderPreference[]
+  loading: boolean
+  modelCount: number
+  disabled: boolean
+  busyModel?: string | null
+  onExpand: (key: string) => void
+  onSelect: (model: ModelSelection) => void
+}) {
+  const { t } = useTranslation()
+  const selectedKey = value ? modelKey(value) : null
+  const list = useRef<HTMLDivElement>(null)
+  const virtualizer = useVirtualizer({
+    count: options.length,
+    getScrollElement: () => list.current,
+    getItemKey: (index) => {
+      const option = options[index]
+      return option ? (option.quantization?.id ?? modelKey(option.model)) : index
+    },
+    estimateSize: () => rowHeight,
+    gap: 2,
+    overscan: 6,
+    initialRect: { width: 240, height: listHeight },
+    observeElementRect: (instance, callback) =>
+      observeElementRect(instance, (rect) =>
+        callback({ width: rect.width || 240, height: rect.height || listHeight }),
+      ),
+    // A row that is not laid out reads 0, which would collapse the window onto every row.
+    measureElement: (element, entry, instance) =>
+      measureElement(element, entry, instance) || rowHeight,
+  })
+  const rows = virtualizer.getVirtualItems()
+
+  return (
+    <ScrollArea
+      viewportRef={list}
+      className='max-h-64 min-w-0 overflow-hidden'
+      viewportClassName='h-auto max-h-64 min-w-0 overscroll-contain'
+    >
+      <div className='grid min-w-0 gap-0.5 py-0.5'>
+        {options.length > 0 && (
+          <div className='relative min-w-0' style={{ height: virtualizer.getTotalSize() }}>
+            <div
+              className='absolute inset-x-0 top-0 grid min-w-0 gap-0.5'
+              style={{ transform: `translateY(${rows[0]?.start ?? 0}px)` }}
+            >
+              {rows.map((row) => {
+                const option = options[row.index]
+                if (!option) return null
+                const { model, quantization } = option
+                const key = modelKey(model)
+                const expandable = !quantization && model.quantizations.length > 0
+                const downloaded =
+                  quantization?.downloaded ??
+                  model.quantizations.some((candidate) => candidate.downloaded)
+                const selected =
+                  key === selectedKey &&
+                  (!quantization ||
+                    quantization.id === (value?.quantization ?? model.quantizations[0]?.id))
+                const provider = providerName(providers, model.provider)
+                return (
+                  <Button
+                    key={row.key}
+                    ref={virtualizer.measureElement}
+                    data-index={row.index}
+                    autoFocus={Boolean(quantization) && row.index === 0}
+                    type='button'
+                    variant='ghost'
+                    aria-label={
+                      quantization
+                        ? undefined
+                        : t('modelPicker.useModel', { model: model.name, provider })
+                    }
+                    aria-pressed={selected}
+                    disabled={disabled}
+                    className='h-auto min-h-9 w-full max-w-full min-w-0 justify-start gap-2 overflow-hidden rounded-lg px-2 py-1 text-left font-normal hover:bg-primary/10'
+                    onClick={() => {
+                      if (expandable) onExpand(key)
+                      else onSelect(modelSelection(model, quantization?.id ?? null))
+                    }}
+                  >
+                    <span className='min-w-0 flex-1 overflow-hidden'>
+                      <span className='block truncate text-[11px] text-foreground'>
+                        {quantization?.name ?? model.name}
+                      </span>
+                      {!quantization && (
+                        <span className='block truncate text-[9px] text-muted-foreground'>
+                          {provider}
+                        </span>
+                      )}
+                    </span>
+                    {downloaded && (
+                      <HardDrive className='size-3.5 shrink-0 text-muted-foreground' />
+                    )}
+                    {!quantization && busyModel === key ? (
+                      <LoaderCircle className='size-3.5 shrink-0 animate-spin text-primary' />
+                    ) : (
+                      selected && <Check className='size-3.5 shrink-0 text-primary' />
+                    )}
+                    {expandable && (
+                      <ChevronRight className='size-3.5 shrink-0 text-muted-foreground' />
+                    )}
+                  </Button>
+                )
+              })}
+            </div>
+          </div>
+        )}
+        {options.length === 0 && (
+          <div className='flex items-center justify-center gap-2 px-2.5 py-5 text-center text-[11px] text-muted-foreground'>
+            {loading && modelCount === 0 && <LoaderCircle className='size-3.5 animate-spin' />}
+            {t(
+              modelCount > 0
+                ? 'modelPicker.noResults'
+                : loading
+                  ? 'modelPicker.loading'
+                  : 'modelPicker.empty',
+            )}
+          </div>
+        )}
+      </div>
+    </ScrollArea>
   )
 }

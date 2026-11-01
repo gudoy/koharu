@@ -1906,6 +1906,7 @@ mod tests {
             None,
             std::sync::Arc::new(crate::ImageCache::default()),
             None,
+            crate::StopToken::default(),
         );
         let processor = Processor::new(
             DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig::default()),

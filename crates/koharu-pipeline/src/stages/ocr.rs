@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::{StageInput, StageProcessor, finish, generation};
-use crate::{ModelCell, OcrModel, scope::geometry_extents};
+use crate::{ModelCell, OcrModel, StopToken, error::Stopped, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use image::DynamicImage;
@@ -140,27 +140,28 @@ impl Model {
             }
         }
 
+        let stop = input.stop.clone();
         let results = match self {
             Self::Manga(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Baberu(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Hayai(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Paddle(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
                 })
                 .await?
@@ -226,6 +227,7 @@ struct OcrResult {
 async fn infer_text<M: Send + 'static>(
     model: Arc<Mutex<M>>,
     targets: Vec<OcrTarget>,
+    stop: StopToken,
     inference: impl Fn(&M, &DynamicImage) -> Result<String> + Send + Sync + 'static,
 ) -> Result<Vec<OcrResult>> {
     tokio_rayon::spawn(move || {
@@ -235,6 +237,9 @@ async fn infer_text<M: Send + 'static>(
         targets
             .into_iter()
             .map(|target| {
+                if stop.stopped() {
+                    return Err(Stopped.into());
+                }
                 Ok(OcrResult {
                     content: target.content,
                     region: target.region,
@@ -281,7 +286,52 @@ fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use image::DynamicImage;
+    use koharu_scene::{EntityId, Geometry};
+
+    use super::{OcrTarget, infer_text, normalize_ocr_text};
+    use crate::{StopToken, error::Stopped};
+
+    #[tokio::test]
+    async fn stop_ends_the_region_loop() {
+        let stop = StopToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let targets = (0..3)
+            .map(|_| OcrTarget {
+                content: EntityId::new(),
+                region: EntityId::new(),
+                geometry: Geometry::rectangle(0.0, 0.0, 1.0, 1.0),
+                previous: None,
+                image: DynamicImage::new_luma8(1, 1),
+            })
+            .collect();
+        let inference = {
+            let stop = stop.clone();
+            let calls = calls.clone();
+            move |_: &(), _: &DynamicImage| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                stop.stop();
+                Ok(String::new())
+            }
+        };
+
+        let result = infer_text(Arc::new(Mutex::new(())), targets, stop, inference).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "OCR kept running after stop"
+        );
+        assert!(
+            result.is_err_and(|error| error.is::<Stopped>()),
+            "a stopped OCR loop must end as stopped, without partial text"
+        );
+    }
 
     #[test]
     fn repeated_placeholder_glyphs_are_an_ellipsis() {

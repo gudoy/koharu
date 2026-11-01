@@ -1,12 +1,15 @@
 'use client'
 
+import { memo } from 'react'
+
 import { InferenceControl } from '@/components/editor/InferenceControl'
 import { call } from '@/lib/backend'
 import { usePage } from '@/lib/queries'
 import { pipelineStages, useKoharuStore, type PipelineScope } from '@/lib/store'
 import { commands, type Scope, type Stage } from '@koharu/bridge/protocol'
 
-export function CanvasCommandBar() {
+// Memoized because the workspace re-renders on every pointer move of a drag or stroke.
+export const CanvasCommandBar = memo(function CanvasCommandBar() {
   const page = usePage().data
   const selectedPages = useKoharuStore((state) => state.selectedPages)
   const jobs = useKoharuStore((state) => state.jobs)
@@ -37,4 +40,4 @@ export function CanvasCommandBar() {
       <InferenceControl disabled={!page || Boolean(running)} onRun={run} />
     </header>
   )
-}
+})

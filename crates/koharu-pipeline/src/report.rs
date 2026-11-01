@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::Stage;
+use crate::{PipelineError, Stage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunStatus {
@@ -19,6 +19,15 @@ pub struct Report {
     pub completed: usize,
     pub total: usize,
     pub elapsed: Duration,
+    /// Stage failures confined to their page. The run still processed every
+    /// other page; the failed page keeps what its earlier stages committed.
+    pub failures: Vec<PageFailure>,
+}
+
+#[derive(Debug)]
+pub struct PageFailure {
+    pub page: koharu_scene::EntityId,
+    pub error: PipelineError,
 }
 
 #[derive(Debug)]
