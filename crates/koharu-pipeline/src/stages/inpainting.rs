@@ -479,11 +479,10 @@ async fn prepare(input: &StageInput) -> Result<InpaintInput> {
     let mut mask = GrayImage::new(source.width(), source.height());
     let mut text_mask = GrayImage::new(source.width(), source.height());
     if let Some(transient) = &input.inpainting_mask {
-        let layer = image::load_from_memory(&transient.png)?.to_luma8();
-        if layer.dimensions() != mask.dimensions() {
+        if transient.mask.dimensions() != mask.dimensions() {
             bail!("inpainting mask dimensions do not match page {page}");
         }
-        mask = layer;
+        mask = GrayImage::clone(&transient.mask);
     } else {
         for role in ["text-mask", "coo-mask"] {
             if let Some(image) = input.images.get(&input.scene, page, role).await? {
@@ -972,7 +971,7 @@ mod tests {
             Arc::new(crate::ImageCache::default()),
             Some(crate::InpaintingMask {
                 page,
-                png: encode(&DynamicImage::ImageLuma8(transient)),
+                mask: Arc::new(transient),
             }),
         );
 
@@ -1037,7 +1036,7 @@ mod tests {
             Arc::new(crate::ImageCache::default()),
             Some(crate::InpaintingMask {
                 page,
-                png: Arc::<[u8]>::from([]),
+                mask: Arc::new(GrayImage::new(8, 8)),
             }),
         );
         let processor = Processor::new(InpaintingModel::LaMa {}, koharu_ml::Device::cpu()).unwrap();

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
-use image::{GrayImage, ImageEncoder as _, codecs::png::PngEncoder};
+use image::GrayImage;
 use koharu_desktop::{CanvasState, Desktop, Frame, TransformFrame};
 use koharu_rasterizer::ResourceId;
 use koharu_scene::{EntityId, Revision};
@@ -347,11 +347,11 @@ pub(crate) async fn commit_inpaint(
             page_value.height.round() as u32,
         )
     };
-    let (png, bounds) =
-        tokio_rayon::spawn(move || encode_mask(width, height, &points, diameter)).await?;
+    let (mask, bounds) =
+        tokio_rayon::spawn(move || rasterize_mask(width, height, &points, diameter)).await?;
     *handle.state::<Processing>().inpainting_mask.lock() = Some(koharu_pipeline::InpaintingMask {
         page,
-        png: Arc::from(png),
+        mask: Arc::new(mask),
     });
     let (job, _) = processing::start(
         &handle,
@@ -371,12 +371,12 @@ fn ensure_revision(actual: Revision, expected: Revision) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn encode_mask(
+fn rasterize_mask(
     width: u32,
     height: u32,
     points: &[Point],
     diameter: f32,
-) -> anyhow::Result<(Vec<u8>, koharu_pipeline::Bounds)> {
+) -> anyhow::Result<(GrayImage, koharu_pipeline::Bounds)> {
     if width == 0 || height == 0 {
         bail!("page dimensions must be positive");
     }
@@ -427,15 +427,8 @@ fn encode_mask(
         }
     }
     let [left, top, right, bottom] = dirty.context("inpaint stroke does not intersect the page")?;
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png).write_image(
-        image.as_raw(),
-        width,
-        height,
-        image::ExtendedColorType::L8,
-    )?;
     Ok((
-        png,
+        image,
         koharu_pipeline::Bounds {
             x: f64::from(left),
             y: f64::from(top),
