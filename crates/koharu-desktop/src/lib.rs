@@ -476,15 +476,10 @@ impl PageFrameCache {
 
     fn insert(&mut self, frame: RenderedFrame) {
         self.clock = self.clock.wrapping_add(1);
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.page == frame.page() && entry.revision == frame.revision())
-        {
-            entry.frame = frame;
-            entry.last_used = self.clock;
-            return;
-        }
+        // Lookups use the project-wide revision, so an older frame of the same page is
+        // unreachable and would only pin its pixel buffers.
+        self.entries
+            .retain(|entry| entry.page != frame.page() || entry.revision > frame.revision());
         self.entries.push(CachedPageFrame {
             page: frame.page(),
             revision: frame.revision(),
@@ -544,6 +539,7 @@ fn transform_point([a, b, c, d, e, f]: [f64; 6], point: &Point) -> Point {
 mod tests {
     use std::{future::pending, sync::Arc, time::Duration};
 
+    use koharu_scene::{At, Origin, PageDraft, Session, Visibility};
     use tokio::{sync::Notify, time::timeout};
 
     use super::Desktop;
@@ -589,5 +585,59 @@ mod tests {
         assert_eq!(desktop.canvas_state().generation, 0);
         assert!(desktop.replace_frame_if_current(latest, None));
         assert_eq!(desktop.canvas_state().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn page_frame_cache_keeps_only_the_newest_frame_of_each_page() {
+        let mut session = Session::memory().await.unwrap();
+        let mut pages = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let first = edit.add_page(PageDraft::new("first", 10.0, 10.0), At::End)?;
+                let second = edit.add_page(PageDraft::new("second", 10.0, 10.0), At::End)?;
+                pages = Some((first, second));
+                Ok(())
+            })
+            .unwrap();
+        let mut snapshot = session.commit(create).await.unwrap().snapshot;
+        let (first, second) = pages.unwrap();
+        let desktop = Desktop::new().unwrap();
+        assert!(desktop.show_page(&snapshot, Some(first)).await.unwrap());
+        assert!(desktop.prepare_page(&snapshot, second).await.unwrap());
+
+        for opacity in [0.9, 0.8, 0.7, 0.6] {
+            let patch = snapshot
+                .patch(|edit| {
+                    edit.set(
+                        first,
+                        &Visibility {
+                            origin: Origin::User,
+                            visible: true,
+                            opacity,
+                        },
+                    )
+                })
+                .unwrap();
+            let commit = session.commit(patch).await.unwrap();
+            assert!(
+                desktop
+                    .synchronize(&commit.snapshot, Some(first), &commit)
+                    .await
+                    .unwrap()
+            );
+            snapshot = commit.snapshot;
+        }
+
+        let cached = desktop
+            .page_frames
+            .lock()
+            .entries
+            .iter()
+            .map(|entry| (entry.page, entry.revision))
+            .collect::<Vec<_>>();
+        assert_eq!(cached.iter().filter(|(page, _)| *page == first).count(), 1);
+        assert!(cached.contains(&(first, snapshot.revision())));
+        assert!(cached.iter().any(|(page, _)| *page == second));
     }
 }
