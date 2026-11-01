@@ -11,7 +11,10 @@ use tauri_runtime_cef::CefRuntime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{ChannelExt as _, Error, canvas::CanvasChannel, project::CurrentProject};
+use super::{
+    ChannelExt as _, Error, canvas::CanvasChannel, lifecycle::Initialization,
+    project::CurrentProject,
+};
 use koharu_desktop::Desktop;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Type)]
@@ -54,6 +57,7 @@ pub struct Job {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
+    Waiting,
     Running,
     Finished,
     Failed,
@@ -72,7 +76,25 @@ pub(crate) struct JobEnd {
 pub(crate) struct Processing {
     pub(crate) stops: Mutex<HashMap<JobId, StopToken>>,
     pub(crate) jobs: Mutex<HashMap<JobId, Job>>,
-    pub(crate) inpainting_mask: Mutex<Option<koharu_pipeline::InpaintingMask>>,
+}
+
+impl Processing {
+    /// Stops every job and returns its terminal update. A job task that ends
+    /// later finds no entry and publishes nothing, so the caller must publish
+    /// these updates.
+    pub(crate) fn stop_all(&self) -> Vec<Job> {
+        for (_, stop) in self.stops.lock().drain() {
+            stop.stop();
+        }
+        self.jobs
+            .lock()
+            .drain()
+            .map(|(_, mut job)| {
+                job.state = JobState::Stopped;
+                job
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -87,16 +109,19 @@ pub(crate) async fn process(
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
 ) -> std::result::Result<JobId, Error> {
-    let (id, _) = start(&handle, scope, operation).await?;
+    let (id, _) = start(&handle, scope, operation, None).await?;
     Ok(id)
 }
 
 /// Starts a pipeline job. The returned task resolves to the job's terminal
-/// state once the run has published its final update.
+/// state once the run has published its final update. The inpainting mask
+/// belongs to this job only, so a rejected start cannot leave it for a later
+/// run.
 pub(crate) async fn start(
     handle: &AppHandle<CefRuntime>,
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
+    inpainting_mask: Option<koharu_pipeline::InpaintingMask>,
 ) -> Result<(JobId, JoinHandle<JobEnd>)> {
     let project = handle.state::<CurrentProject>();
     let processing = handle.state::<Processing>();
@@ -117,9 +142,14 @@ pub(crate) async fn start(
         }
         stops.insert(id, stop.clone());
     }
+    let waiting = !handle.state::<Initialization>().is_ready();
     let job = Job {
         id,
-        state: JobState::Running,
+        state: if waiting {
+            JobState::Waiting
+        } else {
+            JobState::Running
+        },
         completed: 0,
         total: 0,
         page: None,
@@ -130,9 +160,7 @@ pub(crate) async fn start(
     processing.jobs.lock().insert(id, job.clone());
     job_channel.channel.publish(job);
 
-    let pipeline = handle.state::<koharu_pipeline::Pipeline>().inner().clone();
     let task_handle = handle.clone();
-    let inpainting_mask = processing.inpainting_mask.lock().take();
     let task = tokio::spawn(async move {
         let progress = Arc::new(Mutex::new((0_usize, 0_usize)));
         let progress_handle = task_handle.clone();
@@ -227,39 +255,84 @@ pub(crate) async fn start(
         let mut committer = PipelineCommitter {
             handle: task_handle.clone(),
         };
-        let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
-        let result = pipeline.execute(snapshot, request, &mut committer).await;
-        let (stopped, error, failed_pages) = match result {
-            Ok(report) => {
-                let error = (!report.failures.is_empty()).then(|| {
-                    report
-                        .failures
-                        .iter()
-                        .map(|failure| {
-                            let number = pages
-                                .iter()
-                                .position(|page| *page == failure.page)
-                                .map_or_else(
-                                    || failure.page.to_string(),
-                                    |index| (index + 1).to_string(),
-                                );
-                            format!("page {number}: {:#}", failure.error)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                });
-                if let Some(error) = &error {
-                    tracing::error!(pages = report.failures.len(), %error, "processing failed on some pages");
-                }
-                (
-                    report.status == RunStatus::Stopped,
-                    error,
-                    report.failures.len(),
-                )
+        // A job started before the ML runtime is ready waits for it, then
+        // processes the project as it is at that point.
+        let ready = async {
+            if !waiting {
+                return Ok(Some(snapshot));
             }
-            Err(error) => {
-                tracing::error!(stage = ?error.stage, %error, "processing failed");
-                (false, Some(format!("{error:#}")), 0)
+            if !task_handle
+                .state::<Initialization>()
+                .wait_unless(&stop)
+                .await?
+            {
+                return Ok(None);
+            }
+            let snapshot = task_handle
+                .state::<CurrentProject>()
+                .project
+                .lock()
+                .await
+                .as_ref()
+                .context("no project is open")?
+                .snapshot();
+            // Closing or switching the project stops jobs before replacing it.
+            if stop.stopped() {
+                return Ok(None);
+            }
+            let job = task_handle
+                .state::<Processing>()
+                .jobs
+                .lock()
+                .get_mut(&id)
+                .map(|job| {
+                    job.state = JobState::Running;
+                    job.clone()
+                });
+            if let Some(job) = job {
+                task_handle.state::<JobChannel>().channel.publish(job);
+            }
+            Ok::<_, anyhow::Error>(Some(snapshot))
+        };
+        let (stopped, error, failed_pages) = match ready.await {
+            Ok(None) => (true, None, 0),
+            Err(error) => (false, Some(format!("{error:#}")), 0),
+            Ok(Some(snapshot)) => {
+                let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
+                let pipeline = task_handle.state::<koharu_pipeline::Pipeline>();
+                match pipeline.execute(snapshot, request, &mut committer).await {
+                    Ok(report) => {
+                        let error = (!report.failures.is_empty()).then(|| {
+                            report
+                                .failures
+                                .iter()
+                                .map(|failure| {
+                                    let number = pages
+                                        .iter()
+                                        .position(|page| *page == failure.page)
+                                        .map_or_else(
+                                            || failure.page.to_string(),
+                                            |index| (index + 1).to_string(),
+                                        );
+                                    format!("page {number}: {:#}", failure.error)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        });
+                        if let Some(error) = &error {
+                            tracing::error!(pages = report.failures.len(), %error, "processing failed on some pages");
+                        }
+                        (
+                            report.status == RunStatus::Stopped,
+                            error,
+                            report.failures.len(),
+                        )
+                    }
+                    Err(error) => {
+                        tracing::error!(stage = ?error.stage, %error, "processing failed");
+                        (false, Some(format!("{error:#}")), 0)
+                    }
+                }
             }
         };
         task_handle.state::<Processing>().stops.lock().remove(&id);
@@ -304,4 +377,45 @@ pub(crate) async fn stop_job(
         .with_context(|| format!("job {job} is not running"))?;
     stop.stop();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use koharu_pipeline::StopToken;
+
+    use super::{Job, JobId, JobState, Processing};
+
+    #[test]
+    fn stopping_all_jobs_reports_a_waiting_job_as_stopped() {
+        let processing = Processing::default();
+        let id = JobId::new();
+        let stop = StopToken::default();
+        processing.stops.lock().insert(id, stop.clone());
+        processing.jobs.lock().insert(
+            id,
+            Job {
+                id,
+                state: JobState::Waiting,
+                completed: 0,
+                total: 0,
+                page: None,
+                stage: None,
+                model: None,
+                error: None,
+            },
+        );
+
+        let stopped = processing.stop_all();
+
+        assert!(stop.stopped());
+        assert!(processing.stops.lock().is_empty());
+        assert!(processing.jobs.lock().is_empty());
+        assert_eq!(
+            stopped
+                .iter()
+                .map(|job| (job.id, job.state))
+                .collect::<Vec<_>>(),
+            [(id, JobState::Stopped)]
+        );
+    }
 }

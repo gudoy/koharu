@@ -43,31 +43,50 @@ pub enum PageImportSource {
     Folder,
 }
 
+/// The ML runtime starts after the window. Only processing waits for it.
 pub(crate) struct Initialization {
-    ready: tokio::sync::watch::Sender<bool>,
+    state: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
 }
 
 impl Default for Initialization {
     fn default() -> Self {
-        let (ready, _) = tokio::sync::watch::channel(false);
-        Self { ready }
+        let (state, _) = tokio::sync::watch::channel(None);
+        Self { state }
     }
 }
 
 impl Initialization {
     pub(crate) fn ready(&self) {
-        self.ready.send_replace(true);
+        self.state.send_replace(Some(Ok(())));
     }
 
-    async fn wait(&self) -> Result<()> {
-        let mut ready = self.ready.subscribe();
-        while !*ready.borrow_and_update() {
-            ready
-                .changed()
-                .await
-                .context("startup state closed before initialization completed")?;
+    pub(crate) fn failed(&self, error: &anyhow::Error) {
+        self.state.send_replace(Some(Err(format!("{error:#}"))));
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(*self.state.borrow(), Some(Ok(())))
+    }
+
+    /// Waits for the runtime and returns `false` once `stop` is requested.
+    pub(crate) async fn wait_unless(&self, stop: &koharu_pipeline::StopToken) -> Result<bool> {
+        let mut state = self.state.subscribe();
+        loop {
+            if stop.stopped() {
+                return Ok(false);
+            }
+            match &*state.borrow_and_update() {
+                Some(Ok(())) => return Ok(true),
+                Some(Err(error)) => anyhow::bail!("the ML runtime failed to initialize: {error}"),
+                None => {}
+            }
+            // A stop token has no wakeup, so the wait polls it.
+            if let Ok(changed) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), state.changed()).await
+            {
+                changed.context("startup state closed before initialization completed")?;
+            }
         }
-        Ok(())
     }
 }
 
@@ -198,8 +217,6 @@ pub(crate) async fn subscribe(
     on_resources: Channel<ModelResources>,
     on_project: Channel<Option<ProjectInfo>>,
 ) -> std::result::Result<StartupState, Error> {
-    handle.state::<Initialization>().wait().await?;
-
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);
@@ -227,12 +244,9 @@ pub(crate) async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Proj
     let info = opened.info();
 
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    for job in handle.state::<Processing>().stop_all() {
+        handle.state::<JobChannel>().channel.publish(job);
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
 
     let previous = {
         let current = handle.state::<CurrentProject>();
@@ -356,12 +370,9 @@ pub(crate) async fn delete_project(
 
 async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    for job in handle.state::<Processing>().stop_all() {
+        handle.state::<JobChannel>().channel.publish(job);
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
@@ -518,9 +529,58 @@ pub(crate) async fn select_page(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use koharu_pipeline::StopToken;
     use tauri::ipc::{Channel, InvokeResponseBody};
 
-    use super::{ModelResources, ResourceChannel};
+    use super::{Initialization, ModelResources, ResourceChannel};
+
+    #[tokio::test]
+    async fn processing_waits_for_the_runtime_unless_stopped() {
+        let initialization = Initialization::default();
+        let stop = StopToken::default();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                initialization.wait_unless(&stop)
+            )
+            .await
+            .is_err(),
+            "processing must wait for runtime initialization"
+        );
+
+        stop.stop();
+        let ready = tokio::time::timeout(Duration::from_secs(2), initialization.wait_unless(&stop))
+            .await
+            .expect("a stop request must end the wait for the runtime")
+            .unwrap();
+        assert!(!ready);
+
+        initialization.ready();
+        let ready = tokio::time::timeout(
+            Duration::from_secs(2),
+            initialization.wait_unless(&StopToken::default()),
+        )
+        .await
+        .expect("an initialized runtime must not be waited for")
+        .unwrap();
+        assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn processing_reports_a_runtime_that_failed_to_initialize() {
+        let initialization = Initialization::default();
+        initialization.failed(&anyhow::anyhow!("runtime download failed"));
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            initialization.wait_unless(&StopToken::default()),
+        )
+        .await
+        .expect("a failed runtime must not be waited for")
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("runtime download failed"));
+    }
 
     #[test]
     fn a_new_subscriber_receives_the_latest_sample() {

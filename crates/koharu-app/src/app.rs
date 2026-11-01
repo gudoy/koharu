@@ -33,20 +33,6 @@ pub(crate) async fn initialize(handle: AppHandle<CefRuntime>) -> Result<()> {
                 .publish(ModelResources::from(snapshot));
         }
     }));
-
-    let project = handle
-        .state::<CurrentProject>()
-        .project
-        .lock()
-        .await
-        .as_ref()
-        .map(|project| (project.snapshot(), project.active_page()));
-    let desktop = handle.state::<koharu_desktop::Desktop>();
-    if let Some((snapshot, page)) = project {
-        desktop.show_page(&snapshot, page).await?;
-    } else {
-        desktop.clear().await;
-    }
     Ok(())
 }
 
@@ -141,10 +127,16 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
                 .context("failed to focus the main window")?;
             let initialization_handle = handle.clone();
             drop(tauri::async_runtime::spawn(async move {
-                initialize(initialization_handle.clone())
-                    .await
-                    .expect("failed to initialize the desktop runtime");
-                initialization_handle.state::<Initialization>().ready();
+                let initialization = initialization_handle.state::<Initialization>();
+                if let Err(error) = initialize(initialization_handle.clone()).await {
+                    tracing::error!(
+                        error = format!("{error:#}"),
+                        "runtime initialization failed"
+                    );
+                    initialization.failed(&error);
+                    return;
+                }
+                initialization.ready();
                 if let Some(batch) = batch
                     && let Err(error) = crate::commands::batch::run(
                         &initialization_handle,

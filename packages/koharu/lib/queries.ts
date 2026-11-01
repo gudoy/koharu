@@ -152,7 +152,8 @@ export function createJobRefresh(interval = 1000) {
 
   return (job: Job) => {
     const previous = completed.get(job.id) ?? 0
-    if (job.state !== 'running') {
+    // A job waiting for the ML runtime has not ended.
+    if (job.state !== 'running' && job.state !== 'waiting') {
       completed.delete(job.id)
       if (pagesTimer) clearTimeout(pagesTimer)
       pagesTimer = null

@@ -13,7 +13,9 @@ export const CanvasCommandBar = memo(function CanvasCommandBar() {
   const page = usePage().data
   const selectedPages = useKoharuStore((state) => state.selectedPages)
   const jobs = useKoharuStore((state) => state.jobs)
-  const running = Object.values(jobs).find((job) => job.state === 'running')
+  const running = Object.values(jobs).find(
+    (job) => job.state === 'running' || job.state === 'waiting',
+  )
 
   const run = (selection: PipelineScope, stages: Stage[]) => {
     if (!page) return

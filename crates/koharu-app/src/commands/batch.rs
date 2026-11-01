@@ -252,6 +252,7 @@ async fn translate(
             handle,
             koharu_pipeline::Scope::Pages(pending),
             koharu_pipeline::Operation::Full,
+            None,
         )
         .await?;
         let end = task.await.context("processing task failed")?;

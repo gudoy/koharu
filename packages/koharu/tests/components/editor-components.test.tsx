@@ -6,6 +6,7 @@ import {
   renderHook,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from 'next-themes'
@@ -35,6 +36,7 @@ import {
   usePage,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import translations from '@/public/locales/en-US/translation.json'
 import * as canvasRuntime from '@koharu/bridge/canvas'
 import {
   commands,
@@ -2034,6 +2036,40 @@ describe('greenfield editor', () => {
     expect(screen.getByText('Page 1: cover.png')).toBeInTheDocument()
     expect(screen.getByText('manga-ocr')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
+  })
+
+  it('shows processing that waits for the local runtimes and keeps it stoppable', async () => {
+    installProject()
+    useKoharuStore.setState({
+      jobs: {
+        job: {
+          state: 'waiting',
+          id: 'job',
+          completed: 0,
+          total: 0,
+          page: null,
+          stage: null,
+          model: null,
+          error: null,
+        },
+      },
+    })
+    const stop = vi.spyOn(commands, 'stopJob').mockResolvedValue(null)
+    render(
+      <>
+        <CanvasCommandBar />
+        <ActivityCenter />
+      </>,
+    )
+
+    // Checks the row uses the startup status key, whatever its wording.
+    const activity = screen.getByRole('complementary', { name: 'Activity' })
+    const status = within(activity).getByText(translations.startup.status)
+    // The status is a sentence; title-casing it is only right for stage names.
+    expect(status).not.toHaveClass('capitalize')
+    expect(screen.queryByRole('button', { name: 'Run processing' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop processing' }))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
   })
 

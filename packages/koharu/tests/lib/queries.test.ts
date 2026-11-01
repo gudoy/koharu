@@ -52,6 +52,15 @@ describe('job progress refresh', () => {
     expect(invalidated(invalidate, pagesKey)).toBe(2)
   })
 
+  it('does not treat a job waiting for the runtime as ended', () => {
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue()
+    const receive = createJobRefresh(1000)
+
+    receive(job(0, 'active', 'waiting'))
+
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
   it('ignores progress events that complete nothing', () => {
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue()
     const receive = createJobRefresh(1000)

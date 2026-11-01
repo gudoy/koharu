@@ -9,14 +9,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::{
-    AppHandle, Manager as _, State,
+    AppHandle, State,
     ipc::{Channel, IpcResponse},
 };
 use tauri_runtime_cef::CefRuntime;
 
 use super::{
     ChannelExt as _, Error, processing,
-    processing::{JobId, Processing},
+    processing::JobId,
     project::{CurrentProject, Page, Project, RasterStrokeMode},
 };
 
@@ -349,16 +349,16 @@ pub(crate) async fn commit_inpaint(
     };
     let (mask, bounds) =
         tokio_rayon::spawn(move || rasterize_mask(width, height, &points, diameter)).await?;
-    *handle.state::<Processing>().inpainting_mask.lock() = Some(koharu_pipeline::InpaintingMask {
-        page,
-        mask: Arc::new(mask),
-    });
     let (job, _) = processing::start(
         &handle,
         koharu_pipeline::Scope::Region { page, bounds },
         koharu_pipeline::Operation::Only {
             stage: koharu_pipeline::Stage::Inpainting,
         },
+        Some(koharu_pipeline::InpaintingMask {
+            page,
+            mask: Arc::new(mask),
+        }),
     )
     .await?;
     Ok(Some(job))
