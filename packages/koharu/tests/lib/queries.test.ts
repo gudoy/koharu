@@ -42,9 +42,13 @@ describe('job progress refresh', () => {
     const receive = createJobRefresh(1000)
 
     receive(job(1, 'other'))
-    receive(job(1, 'other', 'finished'))
+    receive(job(2, 'other'))
+    receive(job(2, 'other', 'finished'))
 
     expect(invalidated(invalidate, pageKey)).toBe(1)
+    expect(invalidated(invalidate, pagesKey)).toBe(2)
+    // The throttled page-list refresh is already covered by the final one.
+    vi.advanceTimersByTime(1000)
     expect(invalidated(invalidate, pagesKey)).toBe(2)
   })
 
