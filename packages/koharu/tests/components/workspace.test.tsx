@@ -164,6 +164,33 @@ describe('canvas interaction adapter', () => {
     await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledWith(['next']))
   })
 
+  it('prefetches the neighbour once per page visit, not after every commit', async () => {
+    installProject()
+    const summary = { size: { width: 1000, height: 1000 }, source_asset: null, layer_count: 1 }
+    queryClient.setQueryData(pagesKey, [
+      { id: 'page', label: 'Page', ...summary },
+      { id: 'next', label: 'Next', ...summary },
+    ])
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(1))
+
+    for (const generation of [2, 3]) {
+      act(() => {
+        canvasState.generation = generation
+        useKoharuStore.setState({ canvasGeneration: generation, canvasRevision: generation })
+      })
+    }
+    expect(prefetchCanvasPages).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      canvasState.generation = 4
+      queryClient.setQueryData(pageKey, { ...queryClient.getQueryData(pageKey)!, id: 'next' })
+      useKoharuStore.setState({ canvasPage: 'next', canvasGeneration: 4 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(2))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['page'])
+  })
+
   it('renders an accessible browser canvas and keeps camera updates local', async () => {
     installProject()
     const surface = renderWorkspace()

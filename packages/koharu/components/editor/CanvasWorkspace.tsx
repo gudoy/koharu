@@ -94,6 +94,7 @@ export function CanvasWorkspace() {
   const [canvasElement, setCanvasElement] = useState<HTMLCanvasElement | null>(null)
   const gesture = useRef<Gesture | null>(null)
   const previousPageIndex = useRef<number | null>(null)
+  const prefetchedVisit = useRef<string | null>(null)
   const spaceHeld = useRef(false)
   const transformActive = useRef(false)
   const transformRevision = useRef<number | null>(null)
@@ -313,6 +314,11 @@ export function CanvasWorkspace() {
       return
     const index = pages.findIndex((candidate) => candidate.id === pageId)
     if (index < 0) return
+    // Prefetch once per page visit. Every commit advances the project revision, so a neighbour
+    // prepared again after each commit or edit is already stale by the next one; the rail's
+    // hover prefetch prepares it again at the current revision before a switch.
+    if (prefetchedVisit.current === pageId) return
+    prefetchedVisit.current = pageId
     const previous = previousPageIndex.current
     previousPageIndex.current = index
     const direction = previous !== null && index < previous ? -1 : 1
