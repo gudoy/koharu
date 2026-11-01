@@ -300,6 +300,57 @@ async fn revision_one_text_layout_opens_without_an_angle() {
 }
 
 #[tokio::test]
+async fn staged_revisions_publish_only_with_a_commit_or_persist() {
+    fn rename(session: &Session, page: EntityId, label: &str) -> Patch {
+        session
+            .snapshot()
+            .patch(|edit| edit.set_page(page, PageDraft::new(label, 1200.0, 1800.0)))
+            .unwrap()
+    }
+    fn label(session: &Session, page: EntityId) -> String {
+        session.snapshot().page(page).unwrap().page().unwrap().label
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("staged.khrproj");
+    let page;
+    {
+        let mut session = Session::create(&path).await.unwrap();
+        let mut edit = session.snapshot().edit();
+        page = edit
+            .add_page(PageDraft::new("saved", 1200.0, 1800.0), At::End)
+            .unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+        let patch = rename(&session, page, "staged");
+        session.stage(patch).await.unwrap();
+        assert_eq!(label(&session, page), "staged");
+    }
+    let mut session = Session::open(&path).await.unwrap();
+    assert_eq!(
+        label(&session, page),
+        "saved",
+        "a staged revision must not be published on its own"
+    );
+
+    let patch = rename(&session, page, "committed");
+    session.stage(patch).await.unwrap();
+    let mut edit = session.snapshot().edit();
+    edit.add_page(PageDraft::new("next", 1200.0, 1800.0), At::End)
+        .unwrap();
+    session.commit(edit.finish().unwrap()).await.unwrap();
+    drop(session);
+    let mut session = Session::open(&path).await.unwrap();
+    assert_eq!(label(&session, page), "committed");
+
+    let patch = rename(&session, page, "persisted");
+    session.stage(patch).await.unwrap();
+    session.persist().await.unwrap();
+    drop(session);
+    let session = Session::open(&path).await.unwrap();
+    assert_eq!(label(&session, page), "persisted");
+}
+
+#[tokio::test]
 async fn stale_disjoint_patches_can_rebase_without_hiding_conflicts() {
     let mut session = Session::memory().await.unwrap();
     let mut entities = None;

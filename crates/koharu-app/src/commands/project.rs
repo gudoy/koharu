@@ -481,6 +481,7 @@ impl Project {
         &mut self,
         layer: EntityId,
         text: String,
+        _draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -505,6 +506,7 @@ impl Project {
         &mut self,
         layer: EntityId,
         text: Option<String>,
+        _draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -909,6 +911,10 @@ impl Project {
         if commit.changes.to != commit.changes.from {
             self.record(vec![commit.revision]);
         }
+    }
+
+    pub(crate) fn record_text_edit(&mut self, _layer: EntityId, commit: &Commit, _draft: bool) {
+        self.record_commit(commit);
     }
 
     pub(crate) async fn commit_rebased(
@@ -1508,6 +1514,61 @@ mod tests {
         assert_eq!(erased_layer, layer);
         assert_eq!(pixel(&painted.snapshot).0, [210, 40, 20, 255]);
         assert_eq!(pixel(&erased.snapshot).0[3], 0);
+    }
+
+    #[tokio::test]
+    async fn translation_drafts_and_their_commit_are_one_undo_step() {
+        async fn edit(project: &mut Project, layer: EntityId, text: &str, draft: bool) {
+            let commit = project
+                .set_translation(layer, Some(text.to_owned()), draft)
+                .await
+                .unwrap();
+            project.record_text_edit(layer, &commit, draft);
+        }
+        fn translation(project: &Project, layer: EntityId) -> Option<String> {
+            let snapshot = project.snapshot();
+            let content = Project::text_content(&snapshot, layer).unwrap();
+            snapshot
+                .component::<SceneTranslation>(content)
+                .unwrap()
+                .map(|translation| translation.text.value)
+        }
+
+        let mut session = Session::memory().await.unwrap();
+        let mut setup = session.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+        let (commit, layer) = project
+            .add_point_text(page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        edit(&mut project, layer, "Hello", false).await;
+        let steps = project.undo.len();
+
+        edit(&mut project, layer, "H", true).await;
+        edit(&mut project, layer, "Hi", true).await;
+        edit(&mut project, layer, "Hi there", false).await;
+        assert_eq!(
+            project.undo.len(),
+            steps + 1,
+            "typing with pauses and then leaving the field is one undo step"
+        );
+
+        // A commit that only confirms the last draft still ends the session.
+        edit(&mut project, layer, "Hey", true).await;
+        edit(&mut project, layer, "Hey", false).await;
+        edit(&mut project, layer, "Hey you", true).await;
+        assert_eq!(project.undo.len(), steps + 3);
+
+        project.undo().await.unwrap();
+        project.undo().await.unwrap();
+        assert_eq!(translation(&project, layer).as_deref(), Some("Hi there"));
+        project.undo().await.unwrap();
+        assert_eq!(translation(&project, layer).as_deref(), Some("Hello"));
     }
 
     #[test]

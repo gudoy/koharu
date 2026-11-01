@@ -881,7 +881,7 @@ function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void 
               className='max-h-14 min-h-8 w-full max-w-full min-w-0 resize-y overflow-y-auto rounded-md bg-background px-1.5 py-1 text-[12px] leading-4 md:text-[12px]'
               value={layer.content.source?.text ?? ''}
               onCommit={(text) =>
-                void call(commands.setSourceText, layer.id, text)
+                void call(commands.setSourceText, layer.id, text, false)
                   .then(() => refresh(projectKey, pageKey))
                   .catch(() => undefined)
               }
@@ -895,7 +895,7 @@ function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void 
               className='max-h-16 min-h-9 w-full max-w-full min-w-0 resize-y overflow-y-auto rounded-md border-primary/25 bg-background px-1.5 py-1 text-[12px] leading-4 md:text-[12px]'
               value={layer.content.translation?.text ?? ''}
               onCommit={(text) =>
-                void call(commands.setTranslation, layer.id, text.trim() ? text : null)
+                void call(commands.setTranslation, layer.id, text.trim() ? text : null, false)
                   .then(() => refresh(projectKey, pageKey))
                   .catch(() => undefined)
               }

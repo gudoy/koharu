@@ -909,7 +909,49 @@ describe('greenfield editor', () => {
     const source = screen.getByTestId('edit-source-element')
     fireEvent.change(source, { target: { value: 'corrected OCR' } })
     fireEvent.blur(source)
-    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'corrected OCR'))
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'corrected OCR', false))
+  })
+
+  it('previews translation typing and commits the edit once when focus leaves the field', async () => {
+    vi.useFakeTimers()
+    try {
+      installProject()
+      const save = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+      render(<Inspector />)
+      const translation = screen.getByTestId('edit-translation-element')
+      for (const value of ['Hello t', 'Hello th', 'Hello there']) {
+        fireEvent.change(translation, { target: { value } })
+        act(() => vi.advanceTimersByTime(400))
+      }
+      fireEvent.blur(translation)
+      await act(() => vi.runAllTimersAsync())
+
+      expect(save.mock.calls.filter(([, , draft]) => !draft)).toEqual([
+        ['element', 'Hello there', false],
+      ])
+      expect(save.mock.calls.filter(([, , draft]) => draft)).toEqual([
+        ['element', 'Hello t', true],
+        ['element', 'Hello th', true],
+        ['element', 'Hello there', true],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('commits an unfinished translation edit on Mod+Enter and when the field unmounts', async () => {
+    installProject()
+    const save = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+    const { unmount } = render(<Inspector />)
+    const translation = screen.getByTestId('edit-translation-element')
+    fireEvent.change(translation, { target: { value: 'Hello there' } })
+    fireEvent.keyDown(translation, { key: 'Enter', metaKey: true })
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'Hello there', false))
+
+    fireEvent.change(translation, { target: { value: 'Hello again' } })
+    unmount()
+    await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'Hello again', false))
+    expect(save).toHaveBeenCalledTimes(2)
   })
 
   it('shows actual layers with only the useful text-role distinction', () => {

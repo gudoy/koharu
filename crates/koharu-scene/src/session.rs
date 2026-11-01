@@ -138,6 +138,14 @@ impl Session {
         })
     }
 
+    pub async fn stage(&mut self, patch: Patch) -> Result<Commit> {
+        self.commit(patch).await
+    }
+
+    pub async fn persist(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     pub async fn undo(&mut self, revision: crate::Revision) -> Result<Commit> {
         self.undo_many([revision]).await
     }
