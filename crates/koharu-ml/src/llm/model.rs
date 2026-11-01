@@ -15,10 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use koharu_llama::{
-    context::{
-        LlamaContext,
-        params::{LlamaAttentionType, LlamaContextParams},
-    },
+    context::{LlamaContext, params::LlamaContextParams},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaModel, params::LlamaModelParams},
@@ -624,9 +621,6 @@ fn context_config(prepared: &PreparedPrompt, options: &GenerationOptions) -> Res
         .with_n_ctx(Some(values.n_ctx))
         .with_n_batch(values.n_batch)
         .with_n_ubatch(values.n_ubatch);
-    if prepared.non_causal {
-        params = params.with_attention_type(LlamaAttentionType::NonCausal);
-    }
     if let Some(n_threads) = options.n_threads {
         params = params.with_n_threads(n_threads);
     }
@@ -673,6 +667,8 @@ fn context_values(prepared: &PreparedPrompt, options: &GenerationOptions) -> Res
         n_batch >= required_batch,
         "n_batch is too small: need at least {required_batch} tokens"
     );
+    // MTMD switches attention to non-causal for image chunks only (as upstream
+    // mtmd-helper does), and such a chunk must fit in a single ubatch.
     let n_ubatch = if prepared.non_causal {
         n_batch
     } else {
