@@ -38,6 +38,7 @@ const canvasState = vi.hoisted(() => ({
   status: 'ready' as 'loading' | 'switching' | 'ready' | 'recovering' | 'error',
 }))
 const prefetchCanvasPages = vi.hoisted(() => vi.fn(async () => []))
+const toolBarRenders = vi.hoisted(() => ({ count: 0 }))
 
 vi.mock('@/components/editor/useCanvas', () => ({
   useCanvas: () => canvasState,
@@ -46,6 +47,17 @@ vi.mock('@koharu/bridge/canvas', () => ({
   prefetchCanvasPages,
   workspaceColor: () => [245, 245, 245],
 }))
+// The tool bar takes no props and ignores the camera, so each of its renders is
+// a render of the whole workspace.
+vi.mock('@/components/editor/ToolBar', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/editor/ToolBar')>()
+  return {
+    ToolBar: () => {
+      toolBarRenders.count++
+      return actual.ToolBar()
+    },
+  }
+})
 
 const layer: Layer = {
   type: 'image',
@@ -173,6 +185,35 @@ describe('canvas interaction adapter', () => {
     fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: 6 })
 
     await waitFor(() => expect(canvas.setView).toHaveBeenLastCalledWith(1, [0, -10]))
+  })
+
+  it('pans, zooms and hovers without rendering the whole workspace', async () => {
+    installProject()
+    const surface = renderWorkspace()
+    await waitFor(() => expect(canvas.setView).toHaveBeenCalled())
+    const before = toolBarRenders.count
+
+    for (let step = 1; step <= 5; step++) {
+      fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: step })
+      fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: step, ctrlKey: true })
+      fireEvent.pointerMove(surface, { pointerId: 1, clientX: 300 + step, clientY: 300 })
+    }
+
+    await waitFor(() =>
+      expect(canvas.setView).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Array)),
+    )
+    expect(toolBarRenders.count).toBe(before)
+  })
+
+  it('shows the brush outline at the hovered point when a brush tool is chosen', () => {
+    installProject()
+    useKoharuStore.setState({ brush: { diameter: 48, color: '#FFFFFF' } })
+    const surface = renderWorkspace()
+    fireEvent.pointerMove(surface, { pointerId: 1, clientX: 110, clientY: 120 })
+
+    act(() => useKoharuStore.setState({ tool: 'draw' }))
+
+    expect(screen.getByTestId('brush-cursor')).toBeInTheDocument()
   })
 
   it('preserves a manual camera when a newer canvas generation becomes ready', () => {

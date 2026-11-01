@@ -88,6 +88,23 @@ interface StrokeUpdate {
   points: Point[]
 }
 
+// Subscribes to the camera itself so a pan or zoom re-renders only the rectangle.
+function SelectionRectangle({ frame }: { frame: Frame }) {
+  const camera = useKoharuStore((state) => state.camera)
+  return (
+    <div
+      data-testid='selection-rectangle'
+      className='pointer-events-none absolute z-10 border border-[var(--canvas-selection)] bg-[var(--canvas-selection)]/10'
+      style={{
+        left: (frame.x * camera.zoom + camera.translation[0]) / window.devicePixelRatio,
+        top: (frame.y * camera.zoom + camera.translation[1]) / window.devicePixelRatio,
+        width: (frame.width * camera.zoom) / window.devicePixelRatio,
+        height: (frame.height * camera.zoom) / window.devicePixelRatio,
+      }}
+    />
+  )
+}
+
 export function CanvasWorkspace() {
   const { t } = useTranslation()
   const surface = useRef<HTMLDivElement>(null)
@@ -105,12 +122,12 @@ export function CanvasWorkspace() {
   const [draft, setDraft] = useState<Frame | null>(null)
   const [hovered, setHovered] = useState<string | null>(null)
   const [cursor, setCursor] = useState<Point | null>(null)
+  const pointerPosition = useRef<Point | null>(null)
   const colorSampling = useColorSampling()
 
   const page = usePage().data
   const pages = usePages().data
   const canvasPage = useKoharuStore((state) => state.canvasPage)
-  const camera = useKoharuStore((state) => state.camera) 
   const canvasRevision = useKoharuStore((state) => state.canvasRevision)
   const canvasGeneration = useKoharuStore((state) => state.canvasGeneration)
   const canvasSize = useKoharuStore((state) => state.canvasSize)
@@ -141,6 +158,10 @@ export function CanvasWorkspace() {
     )
     return pending
   }, [])
+
+  useEffect(() => {
+    setCursor(isBrushTool(tool) ? pointerPosition.current : null)
+  }, [tool])
 
   const transformUpdates = useFrameCommand((elements: TransformFrame[]) =>
     canvas?.updateTransform(elements),
@@ -436,7 +457,10 @@ export function CanvasWorkspace() {
     const sample = samples.at(-1)
     if (!page || !sample) return
     const physical = clientPhysicalPoint(sample.clientX, sample.clientY)
-    setCursor(physical)
+    // Only the brush outline reads the cursor; tracking it for other tools would
+    // render the whole workspace on every pointer move.
+    pointerPosition.current = physical
+    if (isBrushTool(tool)) setCursor(physical)
     if (!current || current.pointer !== pointer) {
       if (tool === 'select') {
         setHovered(
@@ -520,9 +544,7 @@ export function CanvasWorkspace() {
         .map((layer) => layer.id)
 
       selectLayers(
-        current.additive
-          ? [...new Set([...selected, ...selectedInRect])]
-          : selectedInRect,
+        current.additive ? [...new Set([...selected, ...selectedInRect])] : selectedInRect,
       )
       setSelectionRect(null)
     } else if (current.kind === 'move') {
@@ -552,30 +574,30 @@ export function CanvasWorkspace() {
       const operation =
         current.kind === 'paint'
           ? enqueue(() =>
-            call(commands.commitPaint, current.revision, current.layer, current.points, {
-              diameter: current.diameter,
-              color: current.color!,
-            }),
-          ).then((result) => {
-            selectLayers([result.layer])
-            return refresh(projectKey, pagesKey, pageKey)
-          })
-          : current.kind === 'erase'
-            ? enqueue(() =>
-              call(
-                commands.commitErase,
-                current.revision,
-                current.layer!,
-                current.points,
-                current.diameter,
-              ),
+              call(commands.commitPaint, current.revision, current.layer, current.points, {
+                diameter: current.diameter,
+                color: current.color!,
+              }),
             ).then((result) => {
               selectLayers([result.layer])
               return refresh(projectKey, pagesKey, pageKey)
             })
+          : current.kind === 'erase'
+            ? enqueue(() =>
+                call(
+                  commands.commitErase,
+                  current.revision,
+                  current.layer!,
+                  current.points,
+                  current.diameter,
+                ),
+              ).then((result) => {
+                selectLayers([result.layer])
+                return refresh(projectKey, pagesKey, pageKey)
+              })
             : enqueue(() =>
-              call(commands.commitInpaint, current.revision, current.points, current.diameter),
-            )
+                call(commands.commitInpaint, current.revision, current.points, current.diameter),
+              )
       commitPending.current = true
       void operation
         .catch(() => canvas?.cancelStroke())
@@ -614,7 +636,8 @@ export function CanvasWorkspace() {
             event.currentTarget.setPointerCapture(event.pointerId)
             const physical = clientPhysicalPoint(event.clientX, event.clientY)
             const point = clientPagePoint(event.clientX, event.clientY)
-            setCursor(physical)
+            pointerPosition.current = physical
+            if (isBrushTool(tool)) setCursor(physical)
 
             if (event.button === 1 || tool === 'pan' || spaceHeld.current) {
               gesture.current = {
@@ -757,6 +780,7 @@ export function CanvasWorkspace() {
           onPointerLeave={(event) => {
             if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
               setHovered(null)
+              pointerPosition.current = null
               setCursor(null)
             }
           }}
@@ -814,22 +838,7 @@ export function CanvasWorkspace() {
             useKoharuStore.setState({ camera: { zoom, translation, fitted: false } })
           }}
         >
-          {selectionRect && (
-            <div
-              data-testid='selection-rectangle'
-              className='pointer-events-none absolute z-10 border border-[var(--canvas-selection)] bg-[var(--canvas-selection)]/10'
-              style={{
-                left:
-                  (selectionRect.x * camera.zoom + camera.translation[0]) /
-                  window.devicePixelRatio,
-                top:
-                  (selectionRect.y * camera.zoom + camera.translation[1]) /
-                  window.devicePixelRatio,
-                width: selectionRect.width * camera.zoom / window.devicePixelRatio,
-                height: selectionRect.height * camera.zoom / window.devicePixelRatio,
-              }}
-            />
-          )}
+          {selectionRect && <SelectionRectangle frame={selectionRect} />}
           <canvas
             ref={setCanvasElement}
             data-testid='webgpu-canvas'
@@ -994,7 +1003,7 @@ class FrameCommand<Value> {
   constructor(
     private readonly execute: (value: Value) => void | Promise<unknown>,
     private readonly merge: (current: Value, next: Value) => Value = (_current, next) => next,
-  ) { }
+  ) {}
 
   schedule(value: Value): void {
     this.pending = this.pending === undefined ? value : this.merge(this.pending, value)
