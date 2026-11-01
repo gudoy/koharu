@@ -6,6 +6,7 @@ import {
   renderHook,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from 'next-themes'
@@ -34,6 +35,7 @@ import {
   usePage,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import translations from '@/public/locales/en-US/translation.json'
 import * as canvasRuntime from '@koharu/bridge/canvas'
 import {
   commands,
@@ -1963,7 +1965,9 @@ describe('greenfield editor', () => {
       </>,
     )
 
-    expect(screen.getByText('Initializing local runtimes')).toBeInTheDocument()
+    // Checks the row uses the startup status key, whatever its wording.
+    const activity = screen.getByRole('complementary', { name: 'Activity' })
+    expect(within(activity).getByText(translations.startup.status)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Run processing' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Stop processing' }))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
