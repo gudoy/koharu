@@ -8,7 +8,7 @@ use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
 mod vram;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceResources {
     pub name: String,
     pub selected: bool,
@@ -17,7 +17,7 @@ pub struct DeviceResources {
     pub utilization_percent: Option<f32>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResourceSnapshot {
     pub process_memory_bytes: u64,
     pub system_memory_bytes: u64,
@@ -98,12 +98,21 @@ impl ResourceMonitor {
                         vram::unavailable(&device)
                     }
                 };
-                monitor.changed.send_replace(ResourceSnapshot {
+                let snapshot = ResourceSnapshot {
                     process_memory_bytes: process.map_or(0, sysinfo::Process::memory),
                     system_memory_bytes: system_memory.total_bytes,
                     process_cpu_percent: process.map_or(0.0, sysinfo::Process::cpu_usage)
                         / logical_processors,
                     devices,
+                };
+                // Host values refresh on every fifth tick; a repeated sample
+                // would only wake every subscriber with the same values.
+                monitor.changed.send_if_modified(|current| {
+                    let modified = *current != snapshot;
+                    if modified {
+                        *current = snapshot;
+                    }
+                    modified
                 });
                 monitor.sampled.store(true, Ordering::Release);
                 monitor.sampled_notify.notify_waiters();
@@ -124,5 +133,37 @@ impl ResourceMonitor {
 
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<ResourceSnapshot> {
         self.changed.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::ResourceMonitor;
+
+    #[tokio::test]
+    async fn unchanged_samples_do_not_notify_subscribers() {
+        let monitor = ResourceMonitor::new(&koharu_ml::Device::cpu());
+        let mut changes = monitor.subscribe();
+        monitor.start();
+
+        // Host memory and CPU refresh on every fifth tick, so most samples
+        // repeat the previous one.
+        let mut notified = 0;
+        for _ in 0..10 {
+            let sampled = monitor.sampled_notify.notified();
+            tokio::time::timeout(Duration::from_secs(2), sampled)
+                .await
+                .expect("the monitor samples every 100 ms");
+            if changes.has_changed().unwrap() {
+                changes.borrow_and_update();
+                notified += 1;
+            }
+        }
+        assert!(
+            notified <= 3,
+            "{notified} of 10 samples notified subscribers"
+        );
     }
 }
