@@ -1302,19 +1302,37 @@ describe('greenfield editor', () => {
       vision: false,
       reasoning: false,
     }))
+    const onSelect = vi.fn()
     render(
       <ModelPicker
         value={null}
         models={models}
         providers={preferences.providers.entries}
         onBack={() => undefined}
-        onSelect={() => undefined}
+        onSelect={onSelect}
       />,
     )
 
-    expect(
-      screen.getAllByRole('button', { name: /^Use Model \d+ from/ }).length,
-    ).toBeLessThanOrEqual(40)
+    const rows = () => screen.getAllByRole('button', { name: /^Use Model \d+ from/ })
+    expect(rows().length).toBeLessThanOrEqual(40)
+
+    // jsdom has no layout and does not clamp scrollTop, so scrolling by the full
+    // list height lands the window on the last rows.
+    const viewport = rows()[0]!.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')!
+    const list = rows()[0]!.parentElement!.parentElement!
+    fireEvent.scroll(viewport, { target: { scrollTop: parseFloat(list.style.height) } })
+    expect(screen.queryByRole('button', { name: /^Use Model 0 from/ })).toBeNull()
+    expect(rows().length).toBeLessThanOrEqual(40)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 498 from/ }))
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'vendor/model-498', quantization: null }),
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 49' },
+    })
+    expect(screen.getByRole('button', { name: /^Use Model 499 from/ })).toBeInTheDocument()
+    for (const row of rows()) expect(row).toHaveAccessibleName(/^Use Model 49\d? from/)
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
       target: { value: 'Model 499' },
