@@ -78,6 +78,28 @@ impl Session {
 
     #[tracing::instrument(level = "info", skip_all, fields(project = %self.project_id(), base = %patch.base_revision))]
     pub async fn commit(&mut self, patch: Patch) -> Result<Commit> {
+        self.apply(patch, true).await
+    }
+
+    /// Applies `patch` as an undoable in-memory revision without publishing it.
+    /// The next commit or [`Session::persist`] publishes it with the complete
+    /// state; until then a crash loses it.
+    #[tracing::instrument(level = "info", skip_all, fields(project = %self.project_id(), base = %patch.base_revision))]
+    pub async fn stage(&mut self, patch: Patch) -> Result<Commit> {
+        self.apply(patch, false).await
+    }
+
+    /// Publishes the current revision if it was only staged.
+    pub async fn persist(&mut self) -> Result<()> {
+        if self.current.revision() <= self.storage.revision() {
+            return Ok(());
+        }
+        let stored = self.storage.save(&self.current.storage).await?;
+        self.current = Snapshot::new(Arc::clone(&self.current.state), stored)?;
+        Ok(())
+    }
+
+    async fn apply(&mut self, patch: Patch, publish: bool) -> Result<Commit> {
         if patch.project != self.current.state.document {
             return Err(Error::invalid("patch belongs to another project"));
         }
@@ -110,7 +132,11 @@ impl Session {
             state.referenced_blobs(),
             patch.attachments.iter().cloned(),
         )?;
-        let stored = self.storage.save(&proposed).await?;
+        let stored = if publish {
+            self.storage.save(&proposed).await?
+        } else {
+            proposed
+        };
 
         let inverse = patch
             .operations
@@ -136,14 +162,6 @@ impl Session {
             changes,
             snapshot,
         })
-    }
-
-    pub async fn stage(&mut self, patch: Patch) -> Result<Commit> {
-        self.commit(patch).await
-    }
-
-    pub async fn persist(&mut self) -> Result<()> {
-        Ok(())
     }
 
     pub async fn undo(&mut self, revision: crate::Revision) -> Result<Commit> {

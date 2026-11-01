@@ -238,6 +238,15 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
                 processing.stops.lock().clear();
                 processing.jobs.lock().clear();
                 window.state::<AgentState>().cancel_all();
+                // Live text-edit drafts are staged in memory until saved.
+                let current = window.state::<CurrentProject>();
+                tauri::async_runtime::block_on(async {
+                    if let Some(project) = current.project.lock().await.as_mut()
+                        && let Err(error) = project.session.persist().await
+                    {
+                        tracing::error!(error = format!("{error:#}"), "failed to save the project");
+                    }
+                });
             }
         })
         .run(context)?;

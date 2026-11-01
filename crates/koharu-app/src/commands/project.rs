@@ -262,6 +262,9 @@ pub(crate) struct Project {
     pub(crate) active_page: Option<EntityId>,
     pub(crate) undo: Vec<Vec<Revision>>,
     pub(crate) redo: Vec<Vec<Revision>>,
+    /// The layer whose text-edit session owns the last undo step and is still
+    /// accepting drafts.
+    text_edit: Option<EntityId>,
 }
 
 impl Project {
@@ -287,6 +290,7 @@ impl Project {
             active_page,
             undo: Vec::new(),
             redo: Vec::new(),
+            text_edit: None,
         }
     }
 
@@ -481,7 +485,7 @@ impl Project {
         &mut self,
         layer: EntityId,
         text: String,
-        _draft: bool,
+        draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -499,14 +503,14 @@ impl Project {
                 },
             )
         })?;
-        self.commit(patch).await
+        self.commit_text(patch, draft).await
     }
 
     pub(crate) async fn set_translation(
         &mut self,
         layer: EntityId,
         text: Option<String>,
-        _draft: bool,
+        draft: bool,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
@@ -527,7 +531,18 @@ impl Project {
                 None => edit.remove::<SceneTranslation>(content),
             }
         })?;
-        self.commit(patch).await
+        self.commit_text(patch, draft).await
+    }
+
+    /// A draft previews live typing: it is staged, not saved. The edit that
+    /// ends the session saves the complete state, earlier drafts included.
+    async fn commit_text(&mut self, patch: koharu_scene::Patch, draft: bool) -> Result<Commit> {
+        if draft {
+            return Ok(self.session.stage(patch).await?);
+        }
+        let commit = self.commit(patch).await?;
+        self.session.persist().await?;
+        Ok(commit)
     }
 
     pub(crate) async fn set_typography(
@@ -875,6 +890,7 @@ impl Project {
     }
 
     pub(crate) async fn undo(&mut self) -> Result<Commit> {
+        self.text_edit = None;
         let revisions = self.undo.pop().ok_or_else(|| anyhow!("nothing to undo"))?;
         let commit = match self.session.undo_many(revisions.iter().copied()).await {
             Ok(commit) => commit,
@@ -888,6 +904,7 @@ impl Project {
     }
 
     pub(crate) async fn redo(&mut self) -> Result<Commit> {
+        self.text_edit = None;
         let revisions = self.redo.pop().ok_or_else(|| anyhow!("nothing to redo"))?;
         let commit = match self.session.undo_many(revisions.iter().copied()).await {
             Ok(commit) => commit,
@@ -904,6 +921,7 @@ impl Project {
         if !revisions.is_empty() {
             self.undo.push(revisions);
             self.redo.clear();
+            self.text_edit = None;
         }
     }
 
@@ -913,8 +931,21 @@ impl Project {
         }
     }
 
-    pub(crate) fn record_text_edit(&mut self, _layer: EntityId, commit: &Commit, _draft: bool) {
-        self.record_commit(commit);
+    /// Drafts of one layer's text and the edit that ends them share one undo
+    /// step, like a Photoshop text-edit session.
+    pub(crate) fn record_text_edit(&mut self, layer: EntityId, commit: &Commit, draft: bool) {
+        let open = self.text_edit.take() == Some(layer);
+        let changed = commit.changes.to != commit.changes.from;
+        match self.undo.last_mut() {
+            Some(step) if open && changed => {
+                step.push(commit.revision);
+                self.redo.clear();
+            }
+            _ => self.record_commit(commit),
+        }
+        if draft && (open || changed) {
+            self.text_edit = Some(layer);
+        }
     }
 
     pub(crate) async fn commit_rebased(
