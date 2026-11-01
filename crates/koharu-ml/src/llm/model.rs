@@ -718,10 +718,14 @@ fn round_up(value: u32, step: u32) -> u32 {
 }
 
 fn context_params(key: &ContextKey) -> LlamaContextParams {
+    // Every decode outputs at most one token: the last prompt token or the generated one. By
+    // default llama.cpp reserves n_vocab logits for each micro-batch token in the compute buffer
+    // (1 MiB per token for a 262k vocabulary). Encoder models ignore this limit.
     let mut params = LlamaContextParams::default()
         .with_n_ctx(Some(key.values.n_ctx))
         .with_n_batch(key.values.n_batch)
-        .with_n_ubatch(key.values.n_ubatch);
+        .with_n_ubatch(key.values.n_ubatch)
+        .with_n_outputs_max(1);
     if let Some(n_threads) = key.n_threads {
         params = params.with_n_threads(n_threads);
     }
