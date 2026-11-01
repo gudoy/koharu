@@ -112,6 +112,31 @@ pub(crate) struct ResourceChannel {
     pub(crate) channel: Mutex<Option<Channel<ModelResources>>>,
 }
 
+impl ResourceChannel {
+    /// Replaces the subscriber and sends it the latest sample. Samples are
+    /// published only when they change, so a new subscriber would otherwise
+    /// see nothing until the next change.
+    fn replace(
+        &self,
+        channel: Channel<ModelResources>,
+        latest: &tokio::sync::watch::Receiver<koharu_pipeline::ResourceSnapshot>,
+    ) {
+        // Reading under the channel lock keeps a newer sample from being
+        // forwarded before this one.
+        let mut current = self.channel.lock();
+        let latest = latest.borrow().clone();
+        // The default snapshot means nothing has been sampled yet; the first
+        // sample differs from it and is forwarded when it arrives.
+        if latest != koharu_pipeline::ResourceSnapshot::default()
+            && channel.send(ModelResources::from(latest)).is_err()
+        {
+            *current = None;
+            return;
+        }
+        *current = Some(channel);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ProjectChannel {
     pub(crate) channel: Mutex<Option<Channel<Option<ProjectInfo>>>>,
@@ -164,7 +189,12 @@ pub(crate) async fn subscribe(
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);
-    *handle.state::<ResourceChannel>().channel.lock() = Some(on_resources);
+    let latest = handle
+        .state::<koharu_pipeline::Pipeline>()
+        .subscribe_resources();
+    handle
+        .state::<ResourceChannel>()
+        .replace(on_resources, &latest);
     *handle.state::<ProjectChannel>().channel.lock() = Some(on_project);
 
     let canvas = handle.state::<Desktop>().canvas_state();
@@ -469,4 +499,34 @@ pub(crate) async fn select_page(
         project: project_info,
         page: selected_page,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    use super::{ModelResources, ResourceChannel};
+
+    #[test]
+    fn a_new_subscriber_receives_the_latest_sample() {
+        let sample = koharu_pipeline::ResourceSnapshot {
+            system_memory_bytes: 1024,
+            ..Default::default()
+        };
+        let (_monitor, latest) = tokio::sync::watch::channel(sample);
+        let (sender, received) = std::sync::mpsc::channel();
+        let subscriber = Channel::<ModelResources>::new(move |body| {
+            if let InvokeResponseBody::Json(json) = body {
+                sender.send(json).unwrap();
+            }
+            Ok(())
+        });
+
+        ResourceChannel::default().replace(subscriber, &latest);
+
+        let received = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(received.len(), 1, "received {received:?}");
+        let resources = serde_json::from_str::<serde_json::Value>(&received[0]).unwrap();
+        assert_eq!(resources["system_memory"], 1024);
+    }
 }
