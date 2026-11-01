@@ -7,6 +7,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use koharu_scene::{
+    AssetRole, EntityId, LanguageTag, Origin, RasterLayer, RasterLayerKind, RecognizedFrom, Region,
+    RegionSpec as _, Snapshot, SourceText, TextRegion,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager as _, WebviewWindow};
 use tauri_runtime_cef::CefRuntime;
@@ -213,16 +217,38 @@ async fn translate(
         import_files(handle, folder_files(folder)).await?;
     }
 
-    let (_, task) = processing::start(
-        handle,
-        koharu_pipeline::Scope::Project,
-        koharu_pipeline::Operation::Full,
-    )
-    .await?;
-    match task.await.context("processing task failed")? {
-        (JobState::Stopped, _) => return Ok(Outcome::Stopped),
-        (JobState::Failed, error) => bail!(error.unwrap_or_else(|| "processing failed".to_owned())),
-        _ => {}
+    let target = LanguageTag::new(
+        koharu_pipeline::PipelineConfig::load()?
+            .read()?
+            .translation
+            .target_language
+            .tag(),
+    )?;
+    let pending = pending_pages(
+        &handle
+            .state::<CurrentProject>()
+            .project
+            .lock()
+            .await
+            .as_ref()
+            .context("no project is open")?
+            .snapshot(),
+        &target,
+    )?;
+    if !pending.is_empty() {
+        let (_, task) = processing::start(
+            handle,
+            koharu_pipeline::Scope::Pages(pending),
+            koharu_pipeline::Operation::Full,
+        )
+        .await?;
+        match task.await.context("processing task failed")? {
+            (JobState::Stopped, _) => return Ok(Outcome::Stopped),
+            (JobState::Failed, error) => {
+                bail!(error.unwrap_or_else(|| "processing failed".to_owned()))
+            }
+            _ => {}
+        }
     }
 
     let snapshot = handle
@@ -275,4 +301,227 @@ fn update(
     file.persist(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Pages a batch run still sends through the pipeline. OCR and translation
+/// have no skip of their own, so a resumed run would otherwise redo every page
+/// that finished before the interruption.
+fn pending_pages(snapshot: &Snapshot, target: &LanguageTag) -> Result<Vec<EntityId>> {
+    let mut pending = Vec::new();
+    for page in snapshot.pages() {
+        if !finished(snapshot, page.id(), target)? {
+            pending.push(page.id());
+        }
+    }
+    Ok(pending)
+}
+
+/// A page is finished only when every stage left its output, read the way the
+/// stage itself reads the scene: a detected text region, source text on every
+/// content recognized from one, a translation in the target language for every
+/// non-blank source, and a cleanup layer with an image. User-authored text
+/// counts because no stage rewrites it. A generated translation of a
+/// user-edited source does not: the scene does not record whether the edit came
+/// after it. A page without detected text cannot be told apart from an
+/// unprocessed one, so it is not finished.
+fn finished(snapshot: &Snapshot, page: EntityId, target: &LanguageTag) -> Result<bool> {
+    let mut detected = false;
+    for entity in snapshot.descendants(page)? {
+        if !entity
+            .component::<Region>()?
+            .is_some_and(|region| region.kind == TextRegion::kind())
+        {
+            continue;
+        }
+        detected = true;
+        for relation in snapshot.relations_to_as::<RecognizedFrom>(entity.id()) {
+            if snapshot
+                .component::<SourceText>(relation.value().source)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    if !detected {
+        return Ok(false);
+    }
+    if let Some(group) = snapshot.page(page)?.text_group()? {
+        for layer in group.text_layers()? {
+            let content = layer.content()?;
+            let Some(source) = content.source()? else {
+                continue;
+            };
+            if source.text.value.trim().is_empty() {
+                continue;
+            }
+            let translated = content.translation()?.is_some_and(|translation| {
+                matches!(translation.text.origin, Origin::User)
+                    || (!matches!(source.text.origin, Origin::User)
+                        && translation.language.as_ref() == Some(target))
+            });
+            if !translated {
+                return Ok(false);
+            }
+        }
+    }
+    let image = AssetRole::new("source")?;
+    for child in snapshot.children(page)? {
+        if snapshot
+            .component::<RasterLayer>(child)?
+            .is_some_and(|layer| layer.kind == RasterLayerKind::Cleanup)
+            && snapshot.asset(child, &image)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use koharu_scene::{
+        AssetInput, AssetMetadata, AssetRole, At, Authored, Edit, Generation, Geometry, Origin,
+        PageDraft, ProducerId, RasterLayer, RasterLayerKind, RecognizedFrom, Session, SourceText,
+        TextLayout, TextLayoutKind, TextRegion, Translation,
+    };
+
+    use super::*;
+
+    /// Adds a page and, when `cleaned`, the cleanup layer inpainting leaves.
+    fn add_page(edit: &mut Edit, cleaned: bool) -> EntityId {
+        let page = edit
+            .add_page(PageDraft::new("page", 10.0, 10.0), At::End)
+            .unwrap();
+        if cleaned {
+            let cleanup = edit.add_entity(page, At::Start).unwrap();
+            edit.set(
+                cleanup,
+                &RasterLayer {
+                    origin: Origin::User,
+                    name: "Cleanup".to_owned(),
+                    kind: RasterLayerKind::Cleanup,
+                },
+            )
+            .unwrap();
+            edit.set_asset(
+                cleanup,
+                &AssetRole::new("source").unwrap(),
+                AssetInput::new(
+                    b"clean".as_slice(),
+                    "image/png",
+                    AssetMetadata {
+                        width: Some(1),
+                        height: Some(1),
+                        attributes: Default::default(),
+                    },
+                ),
+            )
+            .unwrap();
+        }
+        page
+    }
+
+    /// Adds a detected text region to `page` and returns its text content.
+    fn add_text(edit: &mut Edit, page: EntityId) -> EntityId {
+        let region = edit
+            .add_analysis_region::<TextRegion>(
+                page,
+                At::End,
+                &Geometry::rectangle(1.0, 1.0, 4.0, 4.0),
+                None,
+            )
+            .unwrap();
+        let content = edit.add_text_content(page, At::End).unwrap();
+        edit.add_text_layer(
+            page,
+            At::End,
+            content,
+            &TextLayout {
+                origin: Origin::User,
+                kind: TextLayoutKind::Paragraph,
+                angle_degrees: None,
+            },
+        )
+        .unwrap();
+        edit.relate::<RecognizedFrom>(content, region).unwrap();
+        content
+    }
+
+    // The edit stamps the origin: a plain edit is the user's, `edit_as` a stage's.
+    fn source(text: &str) -> SourceText {
+        SourceText {
+            text: Authored::user(text.to_owned()),
+            language: None,
+        }
+    }
+
+    fn translation(text: &str, language: Option<&str>) -> Translation {
+        Translation {
+            text: Authored::user(text.to_owned()),
+            language: language.map(|tag| LanguageTag::new(tag).unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_reprocesses_only_pages_a_stage_has_not_finished() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let done = add_page(&mut edit, true);
+        let untranslated = add_page(&mut edit, true);
+        let other_language = add_page(&mut edit, true);
+        let unread = add_page(&mut edit, true);
+        let blank = add_page(&mut edit, true);
+        let edited = add_page(&mut edit, true);
+        let stale = add_page(&mut edit, true);
+        let not_cleaned = add_page(&mut edit, false);
+        let no_text = add_page(&mut edit, true);
+        let done_text = add_text(&mut edit, done);
+        let untranslated_text = add_text(&mut edit, untranslated);
+        let other_language_text = add_text(&mut edit, other_language);
+        add_text(&mut edit, unread);
+        let blank_text = add_text(&mut edit, blank);
+        let edited_text = add_text(&mut edit, edited);
+        let stale_text = add_text(&mut edit, stale);
+        let not_cleaned_text = add_text(&mut edit, not_cleaned);
+        // Neither OCR nor translation rewrites user-authored text.
+        edit.set(edited_text, &source("こんにちは")).unwrap();
+        edit.set(edited_text, &translation("Hi", None)).unwrap();
+        // A generated translation may predate the user's edit of its source.
+        edit.set(stale_text, &source("こんばんは")).unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+
+        let mut edit = session.snapshot().edit_as(Generation::new(
+            ProducerId::new("dev.koharu.pipeline.test").unwrap(),
+        ));
+        for content in [
+            done_text,
+            untranslated_text,
+            other_language_text,
+            not_cleaned_text,
+        ] {
+            edit.set(content, &source("こんにちは")).unwrap();
+        }
+        // Translation skips blank sources, so none is expected.
+        edit.set(blank_text, &source("  ")).unwrap();
+        for content in [done_text, stale_text, not_cleaned_text] {
+            edit.set(content, &translation("Hello", Some("en")))
+                .unwrap();
+        }
+        edit.set(other_language_text, &translation("Bonjour", Some("fr")))
+            .unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+
+        assert_eq!(
+            pending_pages(&session.snapshot(), &LanguageTag::new("en").unwrap()).unwrap(),
+            [
+                untranslated,
+                other_language,
+                unread,
+                stale,
+                not_cleaned,
+                no_text
+            ]
+        );
+    }
 }

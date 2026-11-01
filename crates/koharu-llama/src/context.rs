@@ -4,6 +4,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroI32;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::Arc;
 
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
@@ -23,16 +24,16 @@ pub mod session;
 
 /// Safe wrapper around `llama_context`.
 #[allow(clippy::module_name_repetitions)]
-pub struct LlamaContext<'a> {
+pub struct LlamaContext {
     pub(crate) context: NonNull<koharu_llama_sys::llama_context>,
-    /// a reference to the contexts model.
-    pub model: &'a LlamaModel,
+    /// The context's model, kept alive until after `llama_free`.
+    model: Arc<LlamaModel>,
     initialized_logits: Vec<i32>,
     embeddings_enabled: bool,
     _backend_samplers: Vec<(i32, LlamaSampler)>,
 }
 
-impl Debug for LlamaContext<'_> {
+impl Debug for LlamaContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlamaContext")
             .field("context", &self.context)
@@ -40,9 +41,15 @@ impl Debug for LlamaContext<'_> {
     }
 }
 
-impl<'model> LlamaContext<'model> {
+// SAFETY: a llama.cpp context and the samplers it owns are not tied to the thread that created
+// them. `LlamaContext` is not `Sync`, so one thread uses it at a time. A context that shares
+// another context's memory comes only from the unsafe `new_context_with_ctx_other`, whose caller
+// keeps the pair off concurrent threads.
+unsafe impl Send for LlamaContext {}
+
+impl LlamaContext {
     pub(crate) fn new(
-        llama_model: &'model LlamaModel,
+        llama_model: Arc<LlamaModel>,
         llama_context: NonNull<koharu_llama_sys::llama_context>,
         embeddings_enabled: bool,
     ) -> Self {
@@ -56,7 +63,7 @@ impl<'model> LlamaContext<'model> {
     }
 
     pub(crate) fn with_samplers(
-        llama_model: &'model LlamaModel,
+        llama_model: Arc<LlamaModel>,
         llama_context: NonNull<koharu_llama_sys::llama_context>,
         embeddings_enabled: bool,
         backend_samplers: Vec<(i32, LlamaSampler)>,
@@ -86,6 +93,11 @@ impl<'model> LlamaContext<'model> {
     #[must_use]
     pub fn n_ctx(&self) -> u32 {
         unsafe { koharu_llama_sys::llama_n_ctx(self.context.as_ptr()) }
+    }
+
+    /// Sets whether attention is causal, overriding the attention type the context was created with.
+    pub fn set_causal_attn(&mut self, causal: bool) {
+        unsafe { koharu_llama_sys::llama_set_causal_attn(self.context.as_ptr(), causal) }
     }
 
     /// Decodes the batch.
@@ -393,7 +405,7 @@ impl<'model> LlamaContext<'model> {
     }
 }
 
-impl Drop for LlamaContext<'_> {
+impl Drop for LlamaContext {
     fn drop(&mut self) {
         unsafe { koharu_llama_sys::llama_free(self.context.as_ptr()) }
     }

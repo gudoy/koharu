@@ -63,6 +63,11 @@ impl StageInput {
             entity,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn scene(&self) -> &Snapshot {
+        &self.scene
+    }
 }
 
 #[async_trait]

@@ -1,5 +1,6 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { CanvasWorkspace } from '@/components/editor/CanvasWorkspace'
@@ -37,7 +38,11 @@ const canvasState = vi.hoisted(() => ({
   retry: vi.fn(),
   status: 'ready' as 'loading' | 'switching' | 'ready' | 'recovering' | 'error',
 }))
-const prefetchCanvasPages = vi.hoisted(() => vi.fn(async () => []))
+const prefetchCanvasPages = vi.hoisted(() =>
+  vi.fn(async (pages: string[]) => pages.map((id) => ({ page: { id }, revision: 1 }))),
+)
+const toolBarRenders = vi.hoisted(() => ({ count: 0 }))
+const chromeRenders = vi.hoisted(() => ({ tooltip: 0, slider: 0, popover: 0 }))
 
 vi.mock('@/components/editor/useCanvas', () => ({
   useCanvas: () => canvasState,
@@ -46,6 +51,48 @@ vi.mock('@koharu/bridge/canvas', () => ({
   prefetchCanvasPages,
   workspaceColor: () => [245, 245, 245],
 }))
+// The tool bar takes no props and ignores the camera, so each of its renders is
+// a render of the whole workspace.
+vi.mock('@/components/editor/ToolBar', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/editor/ToolBar')>()
+  return {
+    ToolBar: () => {
+      toolBarRenders.count++
+      return <actual.ToolBar />
+    },
+  }
+})
+// The tool bar's tooltips, the status bar's zoom slider and the inference
+// control's popover count renders of the workspace chrome.
+vi.mock('@koharu/ui/components/tooltip', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@koharu/ui/components/tooltip')>()
+  return {
+    ...actual,
+    Tooltip: (props: ComponentProps<typeof actual.Tooltip>) => {
+      chromeRenders.tooltip++
+      return <actual.Tooltip {...props} />
+    },
+  }
+})
+vi.mock('@koharu/ui/components/slider', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@koharu/ui/components/slider')>()
+  return {
+    Slider: (props: ComponentProps<typeof actual.Slider>) => {
+      chromeRenders.slider++
+      return <actual.Slider {...props} />
+    },
+  }
+})
+vi.mock('@koharu/ui/components/popover', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@koharu/ui/components/popover')>()
+  return {
+    ...actual,
+    Popover: (props: ComponentProps<typeof actual.Popover>) => {
+      chromeRenders.popover++
+      return <actual.Popover {...props} />
+    },
+  }
+})
 
 const layer: Layer = {
   type: 'image',
@@ -85,6 +132,7 @@ beforeEach(() => {
     return frame
   })
   vi.stubGlobal('cancelAnimationFrame', (frame: number) => animationFrames.delete(frame))
+  canvasState.canvas = canvas
   canvasState.error = null
   canvasState.generation = 1
   canvasState.hasFrame = true
@@ -118,6 +166,16 @@ function installProject() {
     canvasGeneration: 1,
     canvasSize: [1000, 1000],
   })
+}
+
+function pageSummaries(ids: string[], layerCount = 1) {
+  return ids.map((id) => ({
+    id,
+    label: id,
+    size: { width: 1000, height: 1000 },
+    source_asset: null,
+    layer_count: layerCount,
+  }))
 }
 
 function renderWorkspace() {
@@ -164,6 +222,78 @@ describe('canvas interaction adapter', () => {
     await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledWith(['next']))
   })
 
+  it('prefetches the neighbour again at a new revision, not on a re-run at the same one', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next']))
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 2))
+      // React Query notifies its observers on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(prefetchCanvasPages).toHaveBeenCalledTimes(1)
+    act(() => {
+      canvasState.canvas = { ...canvas }
+      canvasState.status = 'recovering'
+      useKoharuStore.setState({ canvasSize: [1000, 1000] })
+    })
+    expect(prefetchCanvasPages).toHaveBeenCalledTimes(1)
+    act(() => {
+      canvasState.status = 'ready'
+      queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 3))
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(2))
+
+    act(() => {
+      canvasState.generation = 2
+      useKoharuStore.setState({ canvasGeneration: 2, canvasRevision: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(3))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
+  })
+
+  it('keeps the prefetch direction on a page and follows a changed neighbour', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['first', 'page', 'next']))
+    queryClient.setQueryData(pageKey, { ...queryClient.getQueryData(pageKey)!, id: 'next' })
+    useKoharuStore.setState({ canvasPage: 'next' })
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['page']))
+
+    act(() => {
+      canvasState.generation = 2
+      queryClient.setQueryData(pageKey, { ...queryClient.getQueryData(pageKey)!, id: 'page' })
+      useKoharuStore.setState({ canvasPage: 'page', canvasGeneration: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['first']))
+
+    act(() => {
+      canvasState.generation = 3
+      useKoharuStore.setState({ canvasGeneration: 3, canvasRevision: 2 })
+    })
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(3))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['first'])
+
+    act(() => queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'])))
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(4))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
+  })
+
+  it('prefetches the neighbour again after a superseded prefetch', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next']))
+    prefetchCanvasPages.mockResolvedValueOnce([])
+    renderWorkspace()
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(1))
+    await act(async () => {})
+
+    act(() => queryClient.setQueryData(pagesKey, pageSummaries(['page', 'next'], 2)))
+    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledTimes(2))
+    expect(prefetchCanvasPages).toHaveBeenLastCalledWith(['next'])
+  })
+
   it('renders an accessible browser canvas and keeps camera updates local', async () => {
     installProject()
     const surface = renderWorkspace()
@@ -173,6 +303,70 @@ describe('canvas interaction adapter', () => {
     fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: 6 })
 
     await waitFor(() => expect(canvas.setView).toHaveBeenLastCalledWith(1, [0, -10]))
+  })
+
+  it('pans, zooms and hovers without rendering the whole workspace', async () => {
+    installProject()
+    const surface = renderWorkspace()
+    await waitFor(() => expect(canvas.setView).toHaveBeenCalled())
+    const before = toolBarRenders.count
+
+    for (let step = 1; step <= 5; step++) {
+      fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: step })
+      fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: step, ctrlKey: true })
+      fireEvent.pointerMove(surface, { pointerId: 1, clientX: 300 + step, clientY: 300 })
+    }
+
+    await waitFor(() =>
+      expect(canvas.setView).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Array)),
+    )
+    expect(toolBarRenders.count).toBe(before)
+  })
+
+  it('shows the brush outline at the hovered point when a brush tool is chosen', () => {
+    installProject()
+    useKoharuStore.setState({ brush: { diameter: 48, color: '#FFFFFF' } })
+    const surface = renderWorkspace()
+    fireEvent.pointerMove(surface, { pointerId: 1, clientX: 50, clientY: 60 })
+    fireEvent.pointerMove(surface, { pointerId: 1, clientX: 110, clientY: 120 })
+
+    act(() => useKoharuStore.setState({ tool: 'draw' }))
+
+    // The surface starts at (10, 20), so the last hovered point is (100, 100) inside it.
+    const outline = screen.getByTestId('brush-cursor').style
+    expect(parseFloat(outline.left) + parseFloat(outline.width) / 2).toBe(100)
+    expect(parseFloat(outline.top) + parseFloat(outline.height) / 2).toBe(100)
+  })
+
+  it('keeps the workspace chrome still during a transform drag', async () => {
+    installProject()
+    const commit = vi.spyOn(commands, 'commitTransform').mockResolvedValue(2)
+    const surface = renderWorkspace()
+
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 1, clientX: 70, clientY: 65 })
+    expect(canvas.beginTransform).toHaveBeenCalledOnce()
+    const before = { ...chromeRenders }
+    for (let step = 1; step <= 10; step++) {
+      fireEvent.pointerMove(surface, { pointerId: 1, clientX: 70 + step, clientY: 65 })
+    }
+    expect(chromeRenders).toEqual(before)
+
+    fireEvent.pointerUp(surface, { pointerId: 1, clientX: 80, clientY: 65 })
+    await waitFor(() => expect(commit).toHaveBeenCalledOnce())
+  })
+
+  it('keeps the workspace chrome still during a brush stroke', () => {
+    installProject()
+    useKoharuStore.setState({ tool: 'draw', brush: { diameter: 48, color: '#FFFFFF' } })
+    const surface = renderWorkspace()
+
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 2, clientX: 300, clientY: 300 })
+    expect(canvas.beginStroke).toHaveBeenCalledOnce()
+    const before = { ...chromeRenders }
+    for (let step = 1; step <= 10; step++) {
+      fireEvent.pointerMove(surface, { pointerId: 2, clientX: 300 + step, clientY: 300 })
+    }
+    expect(chromeRenders).toEqual(before)
   })
 
   it('preserves a manual camera when a newer canvas generation becomes ready', () => {

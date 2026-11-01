@@ -136,25 +136,24 @@ pub(crate) async fn start(
             inpainting_mask,
         };
         request.progress = Some(Arc::new(move |event| {
+            // Stage tasks emit concurrently with the run loop. Hold the counter until the job is
+            // written and published so an older count never replaces a newer one.
+            let mut progress = progress.lock();
             let update = match event {
                 Progress::Started { pages, stages } => {
-                    let mut progress = progress.lock();
                     *progress = (0, pages.len().saturating_mul(stages.len()));
                     Some((0, progress.1, None, None, None))
                 }
                 Progress::Loading { page, stage, model } => {
-                    let progress = progress.lock();
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Finished {
                     page, stage, model, ..
                 } => {
-                    let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Skipped { page, stage } => {
-                    let mut progress = progress.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), None))
                 }

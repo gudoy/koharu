@@ -100,6 +100,13 @@ impl Frame {
         self.0.stats
     }
 
+    /// Whether both frames present the same retained layers, which holds when an update found
+    /// nothing on the page affected and only moved the frame to a newer revision.
+    #[must_use]
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.0.page == other.0.page && Arc::ptr_eq(&self.0.layers, &other.0.layers)
+    }
+
     #[must_use]
     pub fn prepared(&self) -> &PreparedFrameBundle {
         &self.0.prepared
@@ -607,16 +614,19 @@ fn prepare_raster_tiles(
     image: &RasterImage,
     resources: &mut Vec<PreparedResource>,
 ) -> Result<PreparedRaster> {
-    let resource = PreparedResource::encoded_raster(
-        image.width,
-        image.height,
-        image.media_type.clone(),
-        Arc::clone(&image.encoded),
-    )
-    .map_err(|error| Error::Backend(anyhow!(error)))?;
-    let source = resource.id();
+    // `build_node` already derived this content id from the same encoded bytes.
+    let source = image.source;
     if !resources.iter().any(|candidate| candidate.id() == source) {
-        resources.push(resource);
+        resources.push(
+            PreparedResource::encoded_raster_with_id(
+                source,
+                image.width,
+                image.height,
+                image.media_type.clone(),
+                Arc::clone(&image.encoded),
+            )
+            .map_err(|error| Error::Backend(anyhow!(error)))?,
+        );
     }
     let mut tiles = Vec::new();
     for y in (0..image.height).step_by(PREPARED_RASTER_TILE_DIMENSION as usize) {
@@ -720,6 +730,44 @@ mod tests {
         };
         assert_eq!((*width, *height), (PREPARED_RASTER_TILE_DIMENSION + 1, 1));
         assert_eq!(bytes.as_ref(), b"encoded-wide-image");
+    }
+
+    #[test]
+    fn prepared_raster_reuses_the_node_content_id() {
+        let source = ResourceId::from_bytes([7; 32]);
+        let image = RasterImage {
+            blob: BlobId::for_bytes(&[0; 4]),
+            source,
+            width: 1,
+            height: 1,
+            media_type: "image/png".to_owned(),
+            encoded: Arc::from(&b"encoded"[..]),
+            pixels: None,
+        };
+        let mut resources = Vec::new();
+
+        let raster = prepare_raster_tiles(&image, &mut resources).unwrap();
+
+        assert_eq!(raster.source, source);
+        assert_eq!(resources[0].id(), source);
+    }
+
+    #[test]
+    fn prepared_raster_rejects_an_invalid_surface() {
+        let image = RasterImage {
+            blob: BlobId::for_bytes(&[0; 4]),
+            source: ResourceId::from_bytes([7; 32]),
+            width: MAX_SURFACE_DIMENSION + 1,
+            height: 1,
+            media_type: "image/png".to_owned(),
+            encoded: Arc::from(&b"encoded"[..]),
+            pixels: None,
+        };
+        let mut resources = Vec::new();
+
+        let prepared = prepare_raster_tiles(&image, &mut resources);
+
+        assert!(prepared.is_err(), "prepared {} resources", resources.len());
     }
 }
 
