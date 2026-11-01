@@ -112,11 +112,9 @@ async fn page_frame(width: u32, height: u32) -> koharu_renderer::Frame {
         })
         .unwrap();
     let snapshot = session.commit(create).await.unwrap().snapshot;
-    Renderer::new()
-        .unwrap()
-        .render(&snapshot, page.unwrap())
-        .await
-        .unwrap()
+    let renderer = Renderer::new().unwrap();
+    let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
+    renderer.decode_rasters(&frame).await.unwrap()
 }
 
 fn rendering_benchmark(c: &mut Criterion) {
@@ -168,7 +166,9 @@ fn rendering_benchmark(c: &mut Criterion) {
     });
 
     let rasterizer = Rasterizer::new();
-    let raster_frame = fixture.frame.raster_frame();
+    let raster_frame = runtime
+        .block_on(fixture.renderer.decode_rasters(&fixture.frame))
+        .and_then(|frame| frame.raster_frame());
     if let (Ok(rasterizer), Ok(raster_frame)) = (rasterizer, raster_frame) {
         c.bench_function("renderer/rasterize_warm_512x768_2_layers", |b| {
             b.iter(|| {

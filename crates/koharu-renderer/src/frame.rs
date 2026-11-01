@@ -112,13 +112,23 @@ impl Frame {
         &self.0.prepared
     }
 
+    /// Builds the native rasterizer input. Raster layers carry pixels only in a
+    /// frame returned by [`crate::Renderer::decode_rasters`].
     pub fn raster_frame(&self) -> Result<koharu_rasterizer::Frame> {
         let raster_sources = self
             .layers()
             .iter()
             .filter_map(|layer| layer.raster_image())
-            .map(|image| (image.source, Arc::clone(&image.pixels)))
-            .collect::<HashMap<_, _>>();
+            .map(|image| {
+                image
+                    .pixels
+                    .clone()
+                    .map(|pixels| (image.source, pixels))
+                    .ok_or_else(|| {
+                        Error::invalid(format!("raster blob {} is not decoded", image.blob))
+                    })
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
         self.0
             .prepared
             .as_ref()
@@ -202,6 +212,54 @@ impl Frame {
             stats: self.0.stats,
             prepared: Arc::new(prepared),
         }))))
+    }
+
+    /// Returns this frame with `pixels` attached to its raster layers. The
+    /// prepared bundle is shared, and the new nodes are owned by the returned
+    /// frame only, so the pixels are released with it.
+    pub(crate) fn with_raster_pixels(&self, pixels: &HashMap<ResourceId, Arc<[u8]>>) -> Self {
+        let layers = self
+            .layers()
+            .iter()
+            .map(|layer| {
+                let Some(image) = layer.raster_image() else {
+                    return layer.clone();
+                };
+                let node = &layer.0.node;
+                Layer(Arc::new(LayerData {
+                    node: Arc::new(RetainedNode {
+                        descriptor: node.descriptor.clone(),
+                        scene: node.scene.clone(),
+                        resources: node.resources.clone(),
+                        local_bounds: node.local_bounds,
+                        image: Some(RasterImage {
+                            pixels: image
+                                .pixels
+                                .clone()
+                                .or_else(|| pixels.get(&image.source).cloned()),
+                            ..image.clone()
+                        }),
+                        text: node.text.clone(),
+                        diagnostics: node.diagnostics.clone(),
+                    }),
+                    ..layer.0.clone_for_frame()
+                }))
+            })
+            .collect();
+        Self(Arc::new(FrameData {
+            revision: self.0.revision,
+            page: self.0.page,
+            width: self.0.width,
+            height: self.0.height,
+            origin: self.0.origin,
+            normalization: self.0.normalization,
+            layers,
+            layer_index: self.0.layer_index.clone(),
+            dependencies: self.0.dependencies.clone(),
+            diagnostics: self.0.diagnostics.clone(),
+            stats: self.0.stats,
+            prepared: self.0.prepared.clone(),
+        }))
     }
 
     pub(crate) fn at_revision(&self, revision: Revision, stats: RetentionStats) -> Self {
@@ -353,7 +411,7 @@ pub struct RasterImage {
     pub(crate) height: u32,
     pub(crate) media_type: String,
     pub(crate) encoded: Arc<[u8]>,
-    pub(crate) pixels: Arc<[u8]>,
+    pub(crate) pixels: Option<Arc<[u8]>>,
 }
 
 impl RasterImage {
@@ -367,9 +425,11 @@ impl RasterImage {
         (self.width, self.height)
     }
 
+    /// Straight RGBA, present only in a frame returned by
+    /// [`crate::Renderer::decode_rasters`].
     #[must_use]
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+    pub fn pixels(&self) -> Option<&[u8]> {
+        self.pixels.as_deref()
     }
 }
 
@@ -646,7 +706,7 @@ mod tests {
             height: 1,
             media_type: "image/png".to_owned(),
             encoded,
-            pixels: pixels.into(),
+            pixels: Some(pixels.into()),
         };
         let mut resources = Vec::new();
 
@@ -682,7 +742,7 @@ mod tests {
             height: 1,
             media_type: "image/png".to_owned(),
             encoded: Arc::from(&b"encoded"[..]),
-            pixels: Arc::from(&[0; 4][..]),
+            pixels: None,
         };
         let mut resources = Vec::new();
 
@@ -701,7 +761,7 @@ mod tests {
             height: 1,
             media_type: "image/png".to_owned(),
             encoded: Arc::from(&b"encoded"[..]),
-            pixels: Arc::from(&[0; 4][..]),
+            pixels: None,
         };
         let mut resources = Vec::new();
 

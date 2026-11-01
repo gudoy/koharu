@@ -1,10 +1,14 @@
-use std::{collections::BTreeMap, io::Cursor, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Cursor,
+    sync::Arc,
+};
 
-use koharu_rasterizer::{PREPARED_RASTER_TILE_DIMENSION, RasterOptions, Rasterizer};
+use koharu_rasterizer::{PREPARED_RASTER_TILE_DIMENSION, RasterOptions, Rasterizer, ResourceId};
 use koharu_renderer::{ImageKind, LayerKind, Renderer};
 use koharu_scene::{
-    AssetInput, AssetMetadata, AssetRole, At, Origin, PageDraft, RasterLayer, RasterLayerKind,
-    Session,
+    AssetInput, AssetMetadata, AssetRole, At, Geometry, Origin, PageDraft, RasterLayer,
+    RasterLayerKind, Session,
 };
 
 fn png(width: u32, height: u32, color: [u8; 4]) -> Arc<[u8]> {
@@ -85,11 +89,8 @@ async fn native_rasterization_preserves_pixels_across_prepared_tile_edges() {
         })
         .unwrap();
     let snapshot = session.commit(patch).await.unwrap().snapshot;
-    let frame = Renderer::new()
-        .unwrap()
-        .render(&snapshot, page.unwrap())
-        .await
-        .unwrap();
+    let renderer = Renderer::new().unwrap();
+    let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
     let manifest = frame.prepared().manifest().unwrap();
     assert_eq!(manifest.resources.len(), 1);
     let koharu_rasterizer::PreparedContent::Raster(prepared) = &manifest.frame.layers[0].content
@@ -98,6 +99,7 @@ async fn native_rasterization_preserves_pixels_across_prepared_tile_edges() {
     };
     assert_eq!(prepared.tiles.len(), 2);
 
+    let frame = renderer.decode_rasters(&frame).await.unwrap();
     let raster = Rasterizer::new()
         .unwrap()
         .rasterize(&frame.raster_frame().unwrap(), RasterOptions::default())
@@ -141,9 +143,10 @@ async fn discarded_image_nodes_are_rebuilt_for_a_reopened_presentation() {
     renderer.render(&snapshot, page).await.unwrap();
     renderer.discard_retained_nodes();
     let reopened = renderer.render(&snapshot, page).await.unwrap();
+    let decoded = renderer.decode_rasters(&reopened).await.unwrap();
     let raster = Rasterizer::new()
         .unwrap()
-        .rasterize(&reopened.raster_frame().unwrap(), RasterOptions::default())
+        .rasterize(&decoded.raster_frame().unwrap(), RasterOptions::default())
         .unwrap();
 
     assert_eq!(reopened.stats().rebuilt_layers, 1);
@@ -203,9 +206,10 @@ async fn rasterized_png_contains_source_and_cleanup_pixels() {
     let snapshot = session.commit(patch).await.unwrap().snapshot;
     let renderer = Renderer::new().unwrap();
     let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
+    let decoded = renderer.decode_rasters(&frame).await.unwrap();
     let raster = Rasterizer::new()
         .unwrap()
-        .rasterize(&frame.raster_frame().unwrap(), RasterOptions::default())
+        .rasterize(&decoded.raster_frame().unwrap(), RasterOptions::default())
         .unwrap();
 
     assert!(frame.layers().iter().any(|layer| matches!(
@@ -218,6 +222,127 @@ async fn rasterized_png_contains_source_and_cleanup_pixels() {
     )));
     assert_eq!(raster.image.get_pixel(0, 0).0, [10, 20, 200, 255]);
     assert_eq!(raster.image.get_pixel(2, 1).0, [240, 30, 20, 255]);
+}
+
+#[tokio::test]
+async fn decoded_rasters_match_an_eager_decode_of_the_same_prepared_frame() {
+    let mut session = Session::memory().await.unwrap();
+    let source = AssetRole::new("source").unwrap();
+    let page_image = image::RgbaImage::from_fn(96, 64, |x, y| {
+        image::Rgba([(x * 2) as u8, (y * 3) as u8, (x ^ y) as u8, 255])
+    });
+    let cleanup_image = image::RgbaImage::from_fn(96, 64, |x, y| {
+        if (x / 8 + y / 8) % 3 == 0 {
+            image::Rgba([250, 250, 250, 255])
+        } else {
+            image::Rgba([200, 10, 10, ((x + y) % 128) as u8])
+        }
+    });
+    let embedded_image = image::RgbaImage::from_fn(12, 10, |x, y| {
+        image::Rgba([(x * 20) as u8, (y * 25) as u8, 99, 180])
+    });
+    let input = |bytes, width, height| {
+        AssetInput::new(
+            bytes,
+            "image/png",
+            AssetMetadata {
+                width: Some(width),
+                height: Some(height),
+                attributes: BTreeMap::new(),
+            },
+        )
+    };
+    let mut ids = None;
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            let page = edit.add_page(PageDraft::new("page", 96.0, 64.0), At::End)?;
+            edit.set_asset(page, &source, input(png_image(page_image), 96, 64))?;
+            let cleanup = edit.add_entity(page, At::End)?;
+            edit.set(
+                cleanup,
+                &RasterLayer {
+                    origin: Origin::User,
+                    name: "Cleanup".to_owned(),
+                    kind: RasterLayerKind::Cleanup,
+                },
+            )?;
+            edit.set_asset(cleanup, &source, input(png_image(cleanup_image), 96, 64))?;
+            let embedded = edit.add_entity(page, At::End)?;
+            edit.set(embedded, &Geometry::rectangle(20.5, 11.0, 24.0, 20.0))?;
+            edit.set_asset(embedded, &source, input(png_image(embedded_image), 12, 10))?;
+            ids = Some((page, embedded));
+            Ok(())
+        })
+        .unwrap();
+    let snapshot = session.commit(patch).await.unwrap().snapshot;
+    let (page, embedded) = ids.unwrap();
+    let renderer = Renderer::new().unwrap();
+    let frame = renderer.render(&snapshot, page).await.unwrap();
+    assert!(
+        frame
+            .layers()
+            .iter()
+            .filter_map(|layer| layer.raster_image())
+            .all(|image| image.pixels().is_none())
+    );
+    assert!(frame.raster_frame().is_err());
+
+    // The eager path decodes every blob up front and feeds the same prepared frame.
+    let mut eager = HashMap::new();
+    for image in frame
+        .layers()
+        .iter()
+        .filter_map(|layer| layer.raster_image())
+    {
+        let bytes = snapshot.read_blob(image.blob()).await.unwrap();
+        let (width, height) = image.size();
+        let pixels = image::load_from_memory(&bytes).unwrap().into_rgba8();
+        eager.insert(
+            ResourceId::for_encoded_raster(width, height, "image/png", &bytes),
+            Arc::<[u8]>::from(pixels.into_raw()),
+        );
+    }
+    let decoded = renderer.decode_rasters(&frame).await.unwrap();
+    assert!(std::ptr::eq(frame.prepared(), decoded.prepared()));
+    let rasterizer = Rasterizer::new().unwrap();
+    let rasterize = |frame: &koharu_rasterizer::Frame| {
+        rasterizer
+            .rasterize(frame, RasterOptions::default())
+            .unwrap()
+    };
+
+    let lazy = rasterize(&decoded.raster_frame().unwrap());
+    let reference = rasterize(
+        &frame
+            .prepared()
+            .clone()
+            .into_frame_with_raster_sources(&eager)
+            .unwrap(),
+    );
+    assert_eq!((lazy.left, lazy.top), (reference.left, reference.top));
+    assert!(lazy.image == reference.image);
+
+    let lazy = rasterize(
+        &decoded
+            .cropped(embedded)
+            .unwrap()
+            .unwrap()
+            .raster_frame()
+            .unwrap(),
+    );
+    let reference = rasterize(
+        &frame
+            .cropped(embedded)
+            .unwrap()
+            .unwrap()
+            .prepared()
+            .clone()
+            .into_frame_with_raster_sources(&eager)
+            .unwrap(),
+    );
+    assert_eq!((lazy.left, lazy.top), (reference.left, reference.top));
+    assert!(lazy.image == reference.image);
 }
 
 #[test]

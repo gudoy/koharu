@@ -263,7 +263,9 @@ async fn source_image(
             .filter(|raster| raster.blob() == asset.blob)
             .and_then(|raster| {
                 let (width, height) = raster.size();
-                RgbaImage::from_raw(width, height, raster.pixels().to_vec())
+                // Only a frame from `Renderer::decode_rasters` carries pixels; any
+                // other frame reads the source blob below.
+                RgbaImage::from_raw(width, height, raster.pixels()?.to_vec())
             }),
         LayerKind::Image(_) | LayerKind::Text(_) => None,
     });
@@ -516,7 +518,14 @@ mod tests {
             .unwrap();
         let snapshot = session.commit(patch).await.unwrap().snapshot;
         let page = page.unwrap();
-        let frame = Renderer::default().render(&snapshot, page).await.unwrap();
+        let renderer = Renderer::default();
+        let frame = renderer.render(&snapshot, page).await.unwrap();
+        // A frame that has not decoded its rasters falls back to the blob.
+        assert_eq!(
+            source_image(&snapshot, &frame).await.unwrap(),
+            Some(pixels.clone())
+        );
+        let frame = renderer.decode_rasters(&frame).await.unwrap();
 
         // The frame already decoded the source; export must not need the blob again.
         let blob = snapshot

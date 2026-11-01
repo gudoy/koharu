@@ -72,7 +72,7 @@ scene.
 One long-lived `Renderer` owns all reusable rendering resources:
 
 - font discovery, bundled-font loading, and font caches;
-- decoded-image cache and bounded decode workers;
+- encoded-image cache and bounded decode workers;
 - retained vector nodes and their dependency index;
 - the headless Vello rasterizer, GPU context, readback buffers, and target pool.
 
@@ -92,7 +92,9 @@ it owns the immutable result needed by every consumer:
 - whole-page and per-layer Vello scenes.
 
 `Frame` contains no `Snapshot`, mutable cache, caller policy, or storage handle.
-Cloning it is O(1).
+Cloning it is O(1). Raster layers keep encoded bytes, which is all presentation
+needs; `Renderer::decode_rasters` returns the same frame with RGBA attached for
+native rasterization, and nothing caches that copy.
 
 ### `Raster`
 
@@ -225,7 +227,7 @@ The target source layout reflects owners rather than public stages:
 | `frame` | Immutable `Frame`, `Layer`, metadata, indexes, vector embedding, cropping. |
 | `fonts` | Discovery, bundled/system loading, fallback, and font cache. |
 | `text` plus layout modules | Unicode segmentation, shaping, fitting, layout, and glyph recording. |
-| `images` | Batched blob loading, decode validation, and byte-bounded cache. |
+| `images` | Batched blob loading, header validation, on-demand decoding, and byte-bounded cache. |
 | `raster` | Vello execution, reusable targets, readback, and downsampling. |
 | `error` | Errors that retain their underlying causes. |
 
