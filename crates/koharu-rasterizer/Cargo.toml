@@ -29,6 +29,6 @@ image = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 postcard = { workspace = true }
-serde = { workspace = true, features = ["rc"] }
+serde = { workspace = true }
 thiserror = { workspace = true }
 vello = { workspace = true }
