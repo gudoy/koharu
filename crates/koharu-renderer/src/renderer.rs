@@ -2379,6 +2379,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presentation_render_retains_only_encoded_raster_bytes() {
+        let mut session = Session::memory().await.unwrap();
+        let source = AssetRole::new("source").unwrap();
+        let page_png = png(64, 48, [10, 20, 200, 255]);
+        let cleanup_png = png(64, 48, [240, 30, 20, 128]);
+        let mut page = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let created = edit.add_page(PageDraft::new("page", 64.0, 48.0), At::End)?;
+                edit.set_asset(created, &source, asset(page_png.clone(), 64, 48))?;
+                let cleanup = edit.add_entity(created, At::Start)?;
+                edit.set(
+                    cleanup,
+                    &RasterLayer {
+                        origin: Origin::User,
+                        name: "Cleanup".to_owned(),
+                        kind: RasterLayerKind::Cleanup,
+                    },
+                )?;
+                edit.set_asset(cleanup, &source, asset(cleanup_png.clone(), 64, 48))?;
+                page = Some(created);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let renderer = Renderer::default();
+
+        let frame = renderer.render(&snapshot, page.unwrap()).await.unwrap();
+
+        // Presentation only ships the encoded bytes; decoded RGBA would be
+        // 64 * 48 * 4 more bytes per layer that nothing on this path reads.
+        let encoded = page_png.len() + cleanup_png.len();
+        let retained = frame
+            .layers()
+            .iter()
+            .map(|layer| NodeCache::retained_bytes(&layer.0.node))
+            .sum::<usize>();
+        assert_eq!(retained, encoded);
+        assert_eq!(renderer.inner.images.lock().bytes(), encoded);
+    }
+
+    #[tokio::test]
     async fn update_rejects_a_non_contiguous_revision_chain() {
         let mut session = Session::memory().await.unwrap();
         let mut page = None;
