@@ -2413,4 +2413,33 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("not contiguous"));
     }
+
+    #[tokio::test]
+    async fn discarding_retained_nodes_releases_decoded_images() {
+        let mut session = Session::memory().await.unwrap();
+        let source = AssetRole::new("source").unwrap();
+        let bytes = png(4, 4, [1, 2, 3, 255]);
+        let blob = BlobId::for_bytes(&bytes);
+        let mut page = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let created = edit.add_page(PageDraft::new("page", 4.0, 4.0), At::End)?;
+                edit.set_asset(created, &source, asset(bytes.clone(), 4, 4))?;
+                page = Some(created);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let renderer = Renderer::new().unwrap();
+        renderer.render(&snapshot, page.unwrap()).await.unwrap();
+        assert!(renderer.inner.images.lock().get(blob).is_some());
+
+        renderer.discard_retained_nodes();
+
+        assert!(
+            renderer.inner.images.lock().get(blob).is_none(),
+            "the decoded page image must be released"
+        );
+    }
 }

@@ -127,6 +127,8 @@ impl Rasterizer {
         })
     }
 
+    pub fn clear_resources(&self) {}
+
     pub fn rasterize(&self, frame: &Frame, options: RasterOptions) -> Result<Raster> {
         let (width, height) = frame.size();
         let (left, top) = frame.origin();
@@ -561,4 +563,87 @@ fn finish_raster(
 
 fn rgba([r, g, b, a]: [u8; 4]) -> Color {
     Color::from_rgba8(r, g, b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use super::*;
+    use crate::{
+        Bounds, LayerId, LayerKind, Point, PreparedContent, PreparedFrame, PreparedFrameBundle,
+        PreparedLayer, PreparedRaster, PreparedRasterTile, PreparedResource, Presentation,
+        Revision,
+    };
+
+    #[test]
+    fn clearing_resources_releases_cached_tiles_and_targets() {
+        let resource =
+            PreparedResource::encoded_raster(2, 1, "image/png", Arc::from(&b"tile"[..])).unwrap();
+        let source = resource.id();
+        let bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 1.0,
+        };
+        let frame = PreparedFrameBundle {
+            frame: PreparedFrame {
+                revision: Revision::new(1),
+                page: LayerId::from_bytes([1; 16]),
+                width: 2,
+                height: 1,
+                origin: (0, 0),
+                normalization: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                layers: vec![PreparedLayer {
+                    id: LayerId::from_bytes([2; 16]),
+                    geometry: vec![
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 2.0, y: 0.0 },
+                        Point { x: 2.0, y: 1.0 },
+                        Point { x: 0.0, y: 1.0 },
+                    ],
+                    bounds,
+                    local_bounds: bounds,
+                    presentation: Presentation {
+                        visible: true,
+                        opacity: 1.0,
+                    },
+                    kind: LayerKind::Raster,
+                    placement: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    content: PreparedContent::Raster(PreparedRaster {
+                        source,
+                        width: 2,
+                        height: 1,
+                        tiles: vec![PreparedRasterTile {
+                            x: 0,
+                            y: 0,
+                            width: 2,
+                            height: 1,
+                            gutter: [0; 4],
+                        }],
+                    }),
+                    element_frame: None,
+                }],
+            },
+            resources: vec![resource],
+        }
+        .into_frame_with_raster_sources(&HashMap::from([(source, Arc::from(&[255; 8][..]))]))
+        .unwrap();
+        let rasterizer = Rasterizer::new().unwrap();
+        rasterizer
+            .rasterize(&frame, RasterOptions::default())
+            .unwrap();
+        {
+            let gpu = rasterizer.gpu.lock();
+            assert_eq!(gpu.compositor.cached_resource_count(), 1);
+            assert_eq!(gpu.targets.len(), 1);
+        }
+
+        rasterizer.clear_resources();
+
+        let gpu = rasterizer.gpu.lock();
+        assert_eq!(gpu.compositor.cached_resource_count(), 0);
+        assert!(gpu.targets.is_empty());
+    }
 }
