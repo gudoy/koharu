@@ -44,4 +44,5 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+koharu-llama = { workspace = true }
 toml = { workspace = true }

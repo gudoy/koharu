@@ -198,3 +198,37 @@ pub(crate) struct StageCompletion {
     pub(crate) elapsed: Duration,
     pub(crate) outcome: std::result::Result<StageOutcome, PipelineError>,
 }
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context as _;
+    use koharu_llama::{DecodeError, LlamaContextLoadError, mtmd::MtmdEvalError};
+
+    use super::is_out_of_memory;
+
+    #[test]
+    fn llama_cpp_allocation_failures_are_out_of_memory() {
+        let context = Err::<(), _>(LlamaContextLoadError::NullReturn)
+            .context("failed to create llama.cpp context")
+            .unwrap_err();
+        let decode = Err::<(), _>(DecodeError::from(std::num::NonZeroI32::new(-2).unwrap()))
+            .context("failed to decode prompt batch")
+            .unwrap_err();
+        let eval = Err::<(), _>(MtmdEvalError::from_code(-2))
+            .context("failed to evaluate multimodal prompt")
+            .unwrap_err();
+
+        assert!(is_out_of_memory(&context));
+        assert!(is_out_of_memory(&decode));
+        assert!(is_out_of_memory(&eval));
+    }
+
+    #[test]
+    fn other_llama_cpp_failures_are_not_out_of_memory() {
+        let invalid = anyhow::Error::new(DecodeError::from(std::num::NonZeroI32::new(-1).unwrap()));
+        let failed = anyhow::Error::new(DecodeError::from(std::num::NonZeroI32::new(-3).unwrap()));
+
+        assert!(!is_out_of_memory(&invalid));
+        assert!(!is_out_of_memory(&failed));
+    }
+}

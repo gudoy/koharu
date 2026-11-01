@@ -4853,6 +4853,7 @@ dependencies = [
  "image",
  "imageproc",
  "koharu-config",
+ "koharu-llama",
  "koharu-ml",
  "koharu-rasterizer",
  "koharu-renderer",
