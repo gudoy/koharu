@@ -671,10 +671,12 @@ impl CanvasState {
             self.evict_resources();
             return Ok(false);
         }
-        self.manifests.insert(frame.page(), manifest);
+        let page = frame.page();
+        self.manifests.insert(page, manifest);
         self.staged = None;
         self.evict_resources();
-        Ok(true)
+        // Eviction drops the page again when it does not fit beside the active frame.
+        Ok(self.manifests.get(&page).is_some())
     }
 
     fn activate_manifest(
