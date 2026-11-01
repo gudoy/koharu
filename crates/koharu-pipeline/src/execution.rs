@@ -5,8 +5,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use futures::{StreamExt as _, stream::FuturesUnordered};
 use koharu_scene::{EntityId, Snapshot};
+use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 use crate::{
     Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
@@ -99,16 +100,20 @@ impl<'a> Execution<'a> {
         self.resources.start();
         self.resources.wait_for_sample().await;
 
-        let runner = self.runner.clone();
-        let mut running = FuturesUnordered::new();
+        // Each stage runs as its own task so it keeps progressing while this loop awaits a
+        // commit. Commits stay serialized here. Dropping the set aborts the stages in flight.
+        let mut running = JoinSet::new();
         loop {
             while let Some(job) = self.take_ready_job() {
-                running.push(runner.run(job));
+                let runner = self.runner.clone();
+                running.spawn(async move { runner.run(job).await }.in_current_span());
             }
 
-            let Some(completion) = running.next().await else {
+            let Some(joined) = running.join_next().await else {
                 break;
             };
+            let completion =
+                joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
             self.busy_stages.remove(&completion.stage);
             if self.stopped() || self.failure.is_some() {
                 continue;
@@ -272,4 +277,149 @@ fn validate_commit(previous: &Snapshot, next: &Snapshot) -> Result<()> {
         "committer did not advance the scene revision"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use koharu_scene::{At, PageDraft, Patch, Session};
+
+    use super::*;
+    use crate::{Operation, PipelineConfig, stages::StageProcessor};
+
+    /// Adds one entity to its page. Each call takes longer than the one before, so two stages in
+    /// flight never finish at the same instant. The third call cannot finish before a commit is
+    /// pending, so that commit always overlaps a stage in flight regardless of timer jitter.
+    struct Delayed {
+        started: AtomicUsize,
+        finished: tokio::sync::watch::Sender<usize>,
+        commit_pending: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl StageProcessor for Delayed {
+        fn model(&self) -> &'static str {
+            "delayed"
+        }
+
+        fn unload(&self) -> bool {
+            false
+        }
+
+        async fn load(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn process(&self, input: StageInput) -> Result<Patch> {
+            let call = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 3 {
+                self.commit_pending.notified().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50 * call as u64)).await;
+            let patch = input.scene().patch(|edit| {
+                edit.add_entity(input.page(), At::End)?;
+                Ok(())
+            })?;
+            self.finished.send_modify(|finished| *finished += 1);
+            Ok(patch)
+        }
+    }
+
+    /// Before each commit, waits for the stages still in flight to finish their processing.
+    struct WaitingCommitter {
+        session: Session,
+        processor: Arc<Delayed>,
+        waits: Vec<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Committer for WaitingCommitter {
+        async fn commit(&mut self, output: StageOutput) -> Result<Snapshot> {
+            let started = self.processor.started.load(Ordering::SeqCst);
+            let mut finished = self.processor.finished.subscribe();
+            if *finished.borrow() < started {
+                self.processor.commit_pending.notify_one();
+                let progressed = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    finished.wait_for(|finished| *finished == started),
+                )
+                .await
+                .is_ok();
+                self.waits.push(progressed);
+            }
+            Ok(self.session.commit(output.patch).await?.snapshot)
+        }
+    }
+
+    #[tokio::test]
+    async fn stages_in_flight_keep_running_while_a_commit_is_pending() {
+        let device = koharu_ml::Device::cpu();
+        let translator = koharu_translator::Translator::from_config(
+            device.clone(),
+            koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
+        )
+        .unwrap();
+        let resources = ResourceMonitor::new(&device);
+        let mut runner = StageRunner::new(
+            &PipelineConfig::default(),
+            translator,
+            &device,
+            resources.clone(),
+        )
+        .unwrap();
+        let processor = Arc::new(Delayed {
+            started: AtomicUsize::new(0),
+            finished: tokio::sync::watch::channel(0).0,
+            commit_pending: tokio::sync::Notify::new(),
+        });
+        runner.set_test_processor(processor.clone());
+        let mut session = Session::memory().await.unwrap();
+        let pages = session
+            .snapshot()
+            .patch(|edit| {
+                edit.add_page(PageDraft::new("one", 1.0, 1.0), At::End)?;
+                edit.add_page(PageDraft::new("two", 1.0, 1.0), At::End)?;
+                Ok(())
+            })
+            .unwrap();
+        session.commit(pages).await.unwrap();
+        let snapshot = session.snapshot();
+        let mut committer = WaitingCommitter {
+            session,
+            processor,
+            waits: Vec::new(),
+        };
+        let request = Request {
+            operation: Operation::Through {
+                stage: Stage::Inpainting,
+            },
+            ..Request::default()
+        };
+
+        let report = Execution::new(
+            Arc::new(runner),
+            resources,
+            snapshot,
+            request,
+            &mut committer,
+        )
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(report.completed, 4);
+        assert!(
+            !committer.waits.is_empty(),
+            "no commit overlapped a stage in flight"
+        );
+        assert!(
+            committer.waits.iter().all(|progressed| *progressed),
+            "a stage in flight stalled while a commit was pending"
+        );
+    }
 }
