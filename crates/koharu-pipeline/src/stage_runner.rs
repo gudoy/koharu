@@ -32,6 +32,11 @@ impl StageRunner {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_processor(&self, other: &Self, stage: Stage) -> bool {
+        self.stages.shares_processor(&other.stages, stage)
+    }
+
     #[tracing::instrument(skip_all)]
     pub(crate) async fn run(&self, job: StageJob) -> StageCompletion {
         let started = Instant::now();

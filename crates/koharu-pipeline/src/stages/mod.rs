@@ -118,6 +118,11 @@ impl Stages {
     pub(crate) fn unload(&self, stage: Stage) -> bool {
         self.processor(stage).unload()
     }
+
+    #[cfg(test)]
+    pub(crate) fn shares_processor(&self, other: &Self, stage: Stage) -> bool {
+        std::ptr::addr_eq(self.processor(stage), other.processor(stage))
+    }
 }
 
 fn generation(producer: &str, model: &str) -> Result<Generation> {
