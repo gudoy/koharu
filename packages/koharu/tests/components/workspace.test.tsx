@@ -242,11 +242,15 @@ describe('canvas interaction adapter', () => {
     installProject()
     useKoharuStore.setState({ brush: { diameter: 48, color: '#FFFFFF' } })
     const surface = renderWorkspace()
+    fireEvent.pointerMove(surface, { pointerId: 1, clientX: 50, clientY: 60 })
     fireEvent.pointerMove(surface, { pointerId: 1, clientX: 110, clientY: 120 })
 
     act(() => useKoharuStore.setState({ tool: 'draw' }))
 
-    expect(screen.getByTestId('brush-cursor')).toBeInTheDocument()
+    // The surface starts at (10, 20), so the last hovered point is (100, 100) inside it.
+    const outline = screen.getByTestId('brush-cursor').style
+    expect(parseFloat(outline.left) + parseFloat(outline.width) / 2).toBe(100)
+    expect(parseFloat(outline.top) + parseFloat(outline.height) / 2).toBe(100)
   })
 
   it('keeps the workspace chrome still during a transform drag', async () => {
