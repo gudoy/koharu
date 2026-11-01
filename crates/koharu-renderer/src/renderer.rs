@@ -49,7 +49,8 @@ const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
 /// Image nodes pin their decoded pixels, so the entry count alone lets a long
-/// session retain every page it has rendered.
+/// session retain every page it has rendered. Pixels shared with the image
+/// cache or another node are counted per node, so this is an upper bound.
 const DEFAULT_RETAINED_NODE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCE_READS: usize = 8;
 const ASSETS_KIND: &str = "dev.koharu.assets";
