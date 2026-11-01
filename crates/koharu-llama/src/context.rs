@@ -42,7 +42,9 @@ impl Debug for LlamaContext {
 }
 
 // SAFETY: a llama.cpp context and the samplers it owns are not tied to the thread that created
-// them. `LlamaContext` is not `Sync`, so one thread uses it at a time.
+// them. `LlamaContext` is not `Sync`, so one thread uses it at a time. A context that shares
+// another context's memory comes only from the unsafe `new_context_with_ctx_other`, whose caller
+// keeps the pair off concurrent threads.
 unsafe impl Send for LlamaContext {}
 
 impl LlamaContext {

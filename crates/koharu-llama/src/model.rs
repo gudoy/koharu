@@ -850,11 +850,17 @@ impl LlamaModel {
     ///
     /// This is required for MTP speculative decoding when the draft context shares target state.
     ///
+    /// # Safety
+    ///
+    /// Depending on the architecture, llama.cpp shares `ctx_other`'s memory module with the new
+    /// context. The caller must keep `ctx_other` alive for as long as the new context, and must
+    /// not use the two contexts from different threads at the same time.
+    ///
     /// # Errors
     ///
     /// See [`LlamaContextLoadError`].
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_context_with_ctx_other(
+    pub unsafe fn new_context_with_ctx_other(
         self: &Arc<Self>,
         _: &LlamaBackend,
         params: LlamaContextParams,
