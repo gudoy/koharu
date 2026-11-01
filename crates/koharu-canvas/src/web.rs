@@ -29,10 +29,11 @@ use web_sys::{
     ImageBitmapOptions, ImageOrientation, PremultiplyAlpha, Window,
 };
 
-use crate::{cache::ResourceUsage, surface::SurfaceBlitter};
+use crate::{
+    cache::{self, PageManifests, ResidentResources, ResourceUsage},
+    surface::SurfaceBlitter,
+};
 
-const RESOURCE_CACHE_BUDGET: u64 = 512 * 1024 * 1024;
-const MAX_CACHED_RESOURCES: usize = 1_024;
 const SAMPLE_ROW_BYTES: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -459,11 +460,30 @@ impl CanvasRenderer {
     }
 }
 
+/// The CPU packet store and GPU tile cache that together hold prepared resources.
+struct Resident<'a> {
+    resources: &'a mut PreparedResourceStore,
+    gpu: &'a mut CanvasRenderer,
+}
+
+impl ResidentResources for Resident<'_> {
+    fn resident_bytes(&self) -> u64 {
+        self.resources
+            .total_bytes()
+            .saturating_add(self.gpu.compositor.cached_resource_bytes())
+    }
+
+    fn release(&mut self, resource: ResourceId) {
+        self.resources.remove(resource);
+        self.gpu.evict_source(resource);
+    }
+}
+
 struct CanvasState {
     gpu: CanvasRenderer,
     frame: Option<PreparedFrame>,
     staged: Option<StagedFrame>,
-    manifests: HashMap<LayerId, PreparedFrameManifest>,
+    manifests: PageManifests,
     resources: PreparedResourceStore,
     resource_usage: ResourceUsage,
     active_resources: HashSet<ResourceId>,
@@ -484,7 +504,7 @@ impl CanvasState {
             gpu,
             frame: None,
             staged: None,
-            manifests: HashMap::new(),
+            manifests: PageManifests::default(),
             resources: PreparedResourceStore::default(),
             resource_usage: ResourceUsage::default(),
             active_resources: HashSet::new(),
@@ -727,33 +747,19 @@ impl CanvasState {
     }
 
     fn evict_resources(&mut self) {
-        let mut protected = self.active_resources.clone();
+        let mut pinned = self.active_resources.clone();
         if let Some(staged) = self.staged.as_ref() {
-            protected.extend(staged.resources.iter().copied());
+            pinned.extend(staged.resources.iter().copied());
         }
-        for manifest in self.manifests.values() {
-            protected.extend(
-                manifest
-                    .required_resources()
-                    .iter()
-                    .map(|resource| resource.id),
-            );
-        }
-        while self
-            .resources
-            .total_bytes()
-            .saturating_add(self.gpu.compositor.cached_resource_bytes())
-            > RESOURCE_CACHE_BUDGET
-            || self.resource_usage.len() > MAX_CACHED_RESOURCES
-        {
-            let candidate = self.resource_usage.oldest_unprotected(&protected);
-            let Some(candidate) = candidate else {
-                break;
-            };
-            self.resources.remove(candidate);
-            self.resource_usage.remove(candidate);
-            self.gpu.evict_source(candidate);
-        }
+        cache::evict(
+            &mut Resident {
+                resources: &mut self.resources,
+                gpu: &mut self.gpu,
+            },
+            &mut self.resource_usage,
+            &mut self.manifests,
+            &pinned,
+        );
     }
 
     fn clear(&mut self) {
@@ -761,7 +767,7 @@ impl CanvasState {
             .cancel_sample("color sample was cancelled by clear");
         self.frame = None;
         self.staged = None;
-        self.manifests.clear();
+        self.manifests = PageManifests::default();
         self.active_resources.clear();
         self.evict_resources();
         self.opacity.clear();

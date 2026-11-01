@@ -1,6 +1,59 @@
 use std::collections::{HashMap, HashSet};
 
-use koharu_rasterizer::ResourceId;
+use koharu_rasterizer::{LayerId, PreparedFrameManifest, ResourceId};
+
+const RESOURCE_CACHE_BUDGET: u64 = 512 * 1024 * 1024;
+const MAX_CACHED_RESOURCES: usize = 1_024;
+
+/// Prepared resources held in CPU and GPU memory.
+pub(crate) trait ResidentResources {
+    fn resident_bytes(&self) -> u64;
+    fn release(&mut self, resource: ResourceId);
+}
+
+/// Manifests of shown and prefetched pages, kept so a page switch can activate without a fetch.
+#[derive(Default)]
+pub(crate) struct PageManifests {
+    entries: HashMap<LayerId, PreparedFrameManifest>,
+}
+
+impl PageManifests {
+    pub(crate) fn get(&self, page: &LayerId) -> Option<&PreparedFrameManifest> {
+        self.entries.get(page)
+    }
+
+    pub(crate) fn insert(&mut self, page: LayerId, manifest: PreparedFrameManifest) {
+        self.entries.insert(page, manifest);
+    }
+
+    fn resources(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        self.entries.values().flat_map(|manifest| {
+            manifest
+                .required_resources()
+                .iter()
+                .map(|resource| resource.id)
+        })
+    }
+}
+
+/// Releases least-recently-used resources while the canvas exceeds its budget. Resources in
+/// `pinned` (the active and staged frames) and those of cached pages stay resident.
+pub(crate) fn evict(
+    resident: &mut impl ResidentResources,
+    usage: &mut ResourceUsage,
+    manifests: &mut PageManifests,
+    pinned: &HashSet<ResourceId>,
+) {
+    let mut protected = pinned.clone();
+    protected.extend(manifests.resources());
+    while resident.resident_bytes() > RESOURCE_CACHE_BUDGET || usage.len() > MAX_CACHED_RESOURCES {
+        let Some(candidate) = usage.oldest_unprotected(&protected) else {
+            break;
+        };
+        resident.release(candidate);
+        usage.remove(candidate);
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ResourceUsage {
