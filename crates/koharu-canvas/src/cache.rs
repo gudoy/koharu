@@ -92,6 +92,21 @@ pub(crate) fn evict(
     }
 }
 
+/// Caches `manifest` for `page`, then evicts over budget. Returns whether the page is still
+/// cached: eviction drops it again when it does not fit beside the pinned frames.
+pub(crate) fn cache_page(
+    resident: &mut impl ResidentResources,
+    usage: &mut ResourceUsage,
+    manifests: &mut PageManifests,
+    pinned: &HashSet<ResourceId>,
+    page: LayerId,
+    manifest: PreparedFrameManifest,
+) -> bool {
+    manifests.insert(page, manifest);
+    evict(resident, usage, manifests, pinned);
+    manifests.get(&page).is_some()
+}
+
 #[derive(Default)]
 pub(crate) struct ResourceUsage {
     entries: HashMap<ResourceId, u64>,
@@ -185,16 +200,17 @@ mod tests {
 
     impl Canvas {
         /// Caches page `value` while page `active` is on screen, as activation and prefetch do.
-        fn cache(&mut self, value: u8, active: u8) {
+        fn cache(&mut self, value: u8, active: u8) -> bool {
             self.resident.insert(id(value), PAGE_BYTES);
             self.usage.insert(id(value));
-            self.pages.insert(page(value), manifest(value));
-            evict(
+            cache_page(
                 &mut self.resident,
                 &mut self.usage,
                 &mut self.pages,
                 &HashSet::from([id(active)]),
-            );
+                page(value),
+                manifest(value),
+            )
         }
 
         fn cached_pages(&self) -> Vec<u8> {
@@ -228,6 +244,21 @@ mod tests {
         }
 
         assert_eq!(canvas.cached_pages(), [1, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn caching_reports_a_page_that_does_not_fit_beside_the_active_page() {
+        let mut canvas = Canvas::default();
+        canvas.cache(1, 1);
+        // The active page alone fills the budget, so a prefetched page cannot stay beside it.
+        canvas.resident.insert(id(1), RESOURCE_CACHE_BUDGET);
+
+        assert!(
+            !canvas.cache(2, 1),
+            "the dropped page must not be reported as cached"
+        );
+        assert_eq!(canvas.cached_pages(), [1]);
+        assert!(!canvas.resident.contains_key(&id(2)));
     }
 
     #[test]

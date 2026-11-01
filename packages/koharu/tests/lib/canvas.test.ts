@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   activateCanvas,
+  createCanvas,
   prefetchCanvasPages,
   previewCanvasOpacity,
   showCanvasPage,
@@ -14,7 +15,15 @@ const commands = vi.hoisted(() => ({
   getCanvasPageResource: vi.fn(),
 }))
 
+const wasm = vi.hoisted(() => ({
+  default: vi.fn(async () => undefined),
+  createCanvas: vi.fn(),
+}))
+
 vi.mock('@koharu/bridge/protocol', () => ({ commands }))
+vi.mock('@/tests/mocks/koharu_canvas', () => wasm)
+
+const manifest = new Uint8Array([1, 2, 3])
 
 describe('canvas runtime', () => {
   it('routes inspector previews only to the active canvas', () => {
@@ -84,5 +93,31 @@ describe('canvas runtime', () => {
     deactivate()
 
     expect(result).toEqual([])
+  })
+
+  it.each([
+    ['activation', (canvas: Canvas) => canvas.activatePage('page', 4)],
+    [
+      'caching',
+      (canvas: Canvas) => canvas.cacheFrame(canvas.stageManifest(manifest).token, 'page'),
+    ],
+  ])('forgets a cached page once %s reports it absent', async (_signal, report) => {
+    let cached = true
+    wasm.createCanvas.mockResolvedValue({
+      setDeviceLostCallback: vi.fn(),
+      stageManifest: vi.fn(() => ({ token: 7, missing: [] })),
+      cacheFrame: vi.fn(() => cached),
+      activatePage: vi.fn(() => cached),
+    })
+    const canvas = await createCanvas(document.createElement('canvas'), vi.fn())
+    canvas.cacheFrame(canvas.stageManifest(manifest).token, 'page')
+
+    cached = false
+    report(canvas)
+    // A full preparation caches the page again without passing its manifest through cacheFrame.
+    cached = true
+    canvas.activatePage('page', 4)
+
+    expect(canvas.hasActiveManifest(manifest)).toBe(false)
   })
 })

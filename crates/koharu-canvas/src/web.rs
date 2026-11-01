@@ -671,10 +671,18 @@ impl CanvasState {
             self.evict_resources();
             return Ok(false);
         }
-        self.manifests.insert(frame.page(), manifest);
         self.staged = None;
-        self.evict_resources();
-        Ok(true)
+        Ok(cache::cache_page(
+            &mut Resident {
+                resources: &mut self.resources,
+                gpu: &mut self.gpu,
+            },
+            &mut self.resource_usage,
+            &mut self.manifests,
+            &self.active_resources,
+            frame.page(),
+            manifest,
+        ))
     }
 
     fn activate_manifest(

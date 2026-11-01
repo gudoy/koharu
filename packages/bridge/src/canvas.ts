@@ -123,6 +123,7 @@ export async function createCanvas(
     activatePage: (page, expectedRevision) => {
       const activated = canvas.activatePage(page, BigInt(expectedRevision))
       if (activated) activeManifest = cachedManifests.get(page) ?? null
+      else cachedManifests.delete(page)
       return activated
     },
     cacheFrame: (token, page) => {
@@ -131,6 +132,7 @@ export async function createCanvas(
         if (cached) cachedManifests.set(page, stagedManifest.bytes)
         stagedManifest = null
       }
+      if (!cached) cachedManifests.delete(page)
       return cached
     },
     clear: () => {
