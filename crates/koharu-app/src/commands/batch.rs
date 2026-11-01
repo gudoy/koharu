@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use koharu_scene::{EntityId, LanguageTag, Snapshot};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager as _, WebviewWindow};
 use tauri_runtime_cef::CefRuntime;
@@ -213,16 +214,38 @@ async fn translate(
         import_files(handle, folder_files(folder)).await?;
     }
 
-    let (_, task) = processing::start(
-        handle,
-        koharu_pipeline::Scope::Project,
-        koharu_pipeline::Operation::Full,
-    )
-    .await?;
-    match task.await.context("processing task failed")? {
-        (JobState::Stopped, _) => return Ok(Outcome::Stopped),
-        (JobState::Failed, error) => bail!(error.unwrap_or_else(|| "processing failed".to_owned())),
-        _ => {}
+    let target = LanguageTag::new(
+        koharu_pipeline::PipelineConfig::load()?
+            .read()?
+            .translation
+            .target_language
+            .tag(),
+    )?;
+    let pending = pending_pages(
+        &handle
+            .state::<CurrentProject>()
+            .project
+            .lock()
+            .await
+            .as_ref()
+            .context("no project is open")?
+            .snapshot(),
+        &target,
+    )?;
+    if !pending.is_empty() {
+        let (_, task) = processing::start(
+            handle,
+            koharu_pipeline::Scope::Pages(pending),
+            koharu_pipeline::Operation::Full,
+        )
+        .await?;
+        match task.await.context("processing task failed")? {
+            (JobState::Stopped, _) => return Ok(Outcome::Stopped),
+            (JobState::Failed, error) => {
+                bail!(error.unwrap_or_else(|| "processing failed".to_owned()))
+            }
+            _ => {}
+        }
     }
 
     let snapshot = handle
@@ -275,4 +298,9 @@ fn update(
     file.persist(path)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Pages a batch run sends through the pipeline.
+fn pending_pages(snapshot: &Snapshot, _target: &LanguageTag) -> Result<Vec<EntityId>> {
+    Ok(snapshot.pages().map(|page| page.id()).collect())
 }
