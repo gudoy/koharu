@@ -39,13 +39,47 @@ pub(crate) fn http() -> Result<Client> {
     if let Some(client) = HTTP_CLIENT.get() {
         return Ok(client.clone());
     }
-    let config = config()?;
-    let client = Client::builder()
+    let client = client(config()?)?;
+    Ok(HTTP_CLIENT.get_or_init(|| client).clone())
+}
+
+fn client(config: Config) -> Result<Client> {
+    Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(config.connect_timeout.max(1)))
         .http2_adaptive_window(true)
         .tcp_keepalive(Duration::from_secs(60))
         .build()
-        .context("failed to build HTTP client")?;
-    Ok(HTTP_CLIENT.get_or_init(|| client).clone())
+        .context("failed to build HTTP client")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_response_fails_after_the_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Accept the connection and keep it open without ever answering.
+        let _server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = client(Config {
+            connect_timeout: 1,
+            read_timeout: 1,
+            max_retries: 0,
+        })
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{address}/")).send(),
+        )
+        .await
+        .expect("request is bounded by the read timeout");
+
+        assert!(response.unwrap_err().is_timeout());
+    }
 }
