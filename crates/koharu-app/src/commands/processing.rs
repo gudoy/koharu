@@ -11,7 +11,10 @@ use tauri_runtime_cef::CefRuntime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{ChannelExt as _, Error, canvas::CanvasChannel, project::CurrentProject};
+use super::{
+    ChannelExt as _, Error, canvas::CanvasChannel, lifecycle::Initialization,
+    project::CurrentProject,
+};
 use koharu_desktop::Desktop;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Type)]
@@ -110,9 +113,14 @@ pub(crate) async fn start(
         }
         stops.insert(id, stop.clone());
     }
+    let waiting = !handle.state::<Initialization>().is_ready();
     let job = Job {
         id,
-        state: JobState::Running,
+        state: if waiting {
+            JobState::Waiting
+        } else {
+            JobState::Running
+        },
         completed: 0,
         total: 0,
         page: None,
@@ -123,7 +131,6 @@ pub(crate) async fn start(
     processing.jobs.lock().insert(id, job.clone());
     job_channel.channel.publish(job);
 
-    let pipeline = handle.state::<koharu_pipeline::Pipeline>().inner().clone();
     let task_handle = handle.clone();
     let inpainting_mask = processing.inpainting_mask.lock().take();
     let task = tokio::spawn(async move {
@@ -210,12 +217,57 @@ pub(crate) async fn start(
         let mut committer = PipelineCommitter {
             handle: task_handle.clone(),
         };
-        let result = pipeline.execute(snapshot, request, &mut committer).await;
-        let (stopped, error) = match result {
-            Ok(report) => (report.status == RunStatus::Stopped, None),
-            Err(error) => {
-                tracing::error!(stage = ?error.stage, %error, "processing failed");
-                (false, Some(format!("{error:#}")))
+        // A job started before the ML runtime is ready waits for it, then
+        // processes the project as it is at that point.
+        let ready = async {
+            if !waiting {
+                return Ok(Some(snapshot));
+            }
+            if !task_handle
+                .state::<Initialization>()
+                .wait_unless(&stop)
+                .await?
+            {
+                return Ok(None);
+            }
+            let snapshot = task_handle
+                .state::<CurrentProject>()
+                .project
+                .lock()
+                .await
+                .as_ref()
+                .context("no project is open")?
+                .snapshot();
+            // Closing or switching the project stops jobs before replacing it.
+            if stop.stopped() {
+                return Ok(None);
+            }
+            let job = task_handle
+                .state::<Processing>()
+                .jobs
+                .lock()
+                .get_mut(&id)
+                .map(|job| {
+                    job.state = JobState::Running;
+                    job.clone()
+                });
+            if let Some(job) = job {
+                task_handle.state::<JobChannel>().channel.publish(job);
+            }
+            Ok::<_, anyhow::Error>(Some(snapshot))
+        };
+        let (stopped, error) = match ready.await {
+            Ok(None) => (true, None),
+            Err(error) => (false, Some(format!("{error:#}"))),
+            Ok(Some(snapshot)) => {
+                let pipeline = task_handle.state::<koharu_pipeline::Pipeline>();
+                match pipeline.execute(snapshot, request, &mut committer).await {
+                    Ok(report) => (report.status == RunStatus::Stopped, None),
+                    Err(error) => {
+                        tracing::error!(stage = ?error.stage, %error, "processing failed");
+                        (false, Some(format!("{error:#}")))
+                    }
+                }
             }
         };
         task_handle.state::<Processing>().stops.lock().remove(&id);

@@ -43,37 +43,50 @@ pub enum PageImportSource {
     Folder,
 }
 
+/// The ML runtime starts after the window. Only processing waits for it.
 pub(crate) struct Initialization {
-    ready: tokio::sync::watch::Sender<bool>,
+    state: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
 }
 
 impl Default for Initialization {
     fn default() -> Self {
-        let (ready, _) = tokio::sync::watch::channel(false);
-        Self { ready }
+        let (state, _) = tokio::sync::watch::channel(None);
+        Self { state }
     }
 }
 
 impl Initialization {
     pub(crate) fn ready(&self) {
-        self.ready.send_replace(true);
+        self.state.send_replace(Some(Ok(())));
     }
 
-    async fn wait(&self) -> Result<()> {
-        let mut ready = self.ready.subscribe();
-        while !*ready.borrow_and_update() {
-            ready
-                .changed()
-                .await
-                .context("startup state closed before initialization completed")?;
+    pub(crate) fn failed(&self, error: &anyhow::Error) {
+        self.state.send_replace(Some(Err(format!("{error:#}"))));
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(*self.state.borrow(), Some(Ok(())))
+    }
+
+    /// Waits for the runtime and returns `false` once `stop` is requested.
+    pub(crate) async fn wait_unless(&self, stop: &koharu_pipeline::StopToken) -> Result<bool> {
+        let mut state = self.state.subscribe();
+        loop {
+            if stop.stopped() {
+                return Ok(false);
+            }
+            match &*state.borrow_and_update() {
+                Some(Ok(())) => return Ok(true),
+                Some(Err(error)) => anyhow::bail!("the ML runtime failed to initialize: {error}"),
+                None => {}
+            }
+            // A stop token has no wakeup, so the wait polls it.
+            if let Ok(changed) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), state.changed()).await
+            {
+                changed.context("startup state closed before initialization completed")?;
+            }
         }
-        Ok(())
-    }
-
-    pub(crate) fn failed(&self, _error: &anyhow::Error) {}
-
-    pub(crate) async fn wait_unless(&self, _stop: &koharu_pipeline::StopToken) -> Result<bool> {
-        self.wait().await.map(|()| true)
     }
 }
 
@@ -165,8 +178,6 @@ pub(crate) async fn subscribe(
     on_resources: Channel<ModelResources>,
     on_project: Channel<Option<ProjectInfo>>,
 ) -> std::result::Result<StartupState, Error> {
-    handle.state::<Initialization>().wait().await?;
-
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);

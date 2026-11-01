@@ -24,7 +24,7 @@ export function ActivityCenter() {
     (activity): activity is { id: number; label: string } => typeof activity.label === 'string',
   )
   const visibleJobs = Object.values(jobs).filter(
-    (job) => job.state === 'running' || job.state === 'failed',
+    (job) => job.state === 'waiting' || job.state === 'running' || job.state === 'failed',
   )
   const runningDownloads = Object.values(downloads).filter(
     (download) => download.state === 'running',
@@ -129,9 +129,11 @@ function JobItem({ job }: { job: Job }) {
         <span className='mt-1.5 size-1.5 justify-self-center rounded-full bg-primary' />
         <div className='min-w-0'>
           <span className='block truncate text-[12px] font-medium capitalize'>
-            {job.stage
-              ? t(`phase.${job.stage}`, { defaultValue: job.stage })
-              : t('activity.processing')}
+            {job.state === 'waiting'
+              ? t('startup.status')
+              : job.stage
+                ? t(`phase.${job.stage}`, { defaultValue: job.stage })
+                : t('activity.processing')}
           </span>
         </div>
         <span className='pt-0.5 text-right text-[10px] tabular-nums'>

@@ -17,6 +17,7 @@ use crate::commands::{
     ChannelExt as _,
     canvas::{CanvasChannel, Point},
     editing::{GeometryUpdate, TypographyUpdate},
+    lifecycle::Initialization,
     output,
     preferences::Preferences,
     processing::{JobId, Processing},
@@ -119,6 +120,14 @@ impl KoharuHost {
     async fn run_pipeline(&self, arguments: RunPipeline, control: &Control) -> Result<Invocation> {
         let scope = arguments.scope()?;
         let operation = arguments.operation.into();
+        let initialization = self.handle.state::<Initialization>();
+        let unstoppable = StopToken::default();
+        tokio::select! {
+            ready = initialization.wait_unless(&unstoppable) => {
+                ready?;
+            }
+            () = control.cancelled() => bail!("pipeline processing was cancelled"),
+        }
         let snapshot = self
             .handle
             .state::<CurrentProject>()

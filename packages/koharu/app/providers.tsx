@@ -53,7 +53,7 @@ export function Providers({ children }: { children: ReactNode }) {
             const previous = completed.get(job.id) ?? 0
             completed.set(job.id, job.completed)
             receiveJob(job)
-            if (job.completed > previous || job.state !== 'running') {
+            if (job.completed > previous || (job.state !== 'running' && job.state !== 'waiting')) {
               void refresh(projectKey, pagesKey, pageKey).catch(() => undefined)
             }
           }),
