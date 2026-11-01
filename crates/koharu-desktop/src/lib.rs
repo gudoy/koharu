@@ -118,7 +118,9 @@ impl Desktop {
     }
 
     pub async fn prepare_page(&self, snapshot: &Snapshot, page: EntityId) -> Result<bool> {
-        let request = self.request_preparation();
+        // A prefetch joins the current request instead of issuing one: presentation preempts
+        // it, but it never preempts presentation.
+        let request = self.presentation.read().requested_preparation;
         let _preparation = self.preparation.lock().await;
         if !self.is_current_preparation(request) {
             return Ok(false);
@@ -577,6 +579,53 @@ mod tests {
                 .await,
             Some(7)
         );
+    }
+
+    #[tokio::test]
+    async fn page_prefetch_waits_for_the_presentation_instead_of_preempting_it() {
+        let mut session = koharu_scene::Session::memory().await.unwrap();
+        let mut page = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let draft = koharu_scene::PageDraft::new("page", 10.0, 10.0);
+                page = Some(edit.add_page(draft, koharu_scene::At::End)?);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let desktop = Arc::new(Desktop::new().unwrap());
+        let presentation_request = desktop.request_preparation();
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let started = Arc::new(Notify::new());
+        let presentation = {
+            let desktop = Arc::clone(&desktop);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                let _preparation = desktop.preparation.lock().await;
+                started.notify_one();
+                desktop
+                    .await_preparation(presentation_request, finished)
+                    .await
+            })
+        };
+        started.notified().await;
+
+        let prefetch = desktop.prepare_page(&snapshot, page);
+        tokio::pin!(prefetch);
+        tokio::select! {
+            biased;
+            _ = &mut prefetch => panic!("the prefetch must wait for the presentation's lock"),
+            () = std::future::ready(()) => {}
+        }
+        finish.send(()).unwrap();
+
+        assert!(
+            presentation.await.unwrap().is_some(),
+            "a page prefetch superseded the presentation"
+        );
+        assert!(prefetch.await.unwrap());
     }
 
     #[tokio::test]
