@@ -28,13 +28,9 @@ pub(crate) async fn initialize(handle: AppHandle<CefRuntime>) -> Result<()> {
     drop(tauri::async_runtime::spawn(async move {
         while resources.changed().await.is_ok() {
             let snapshot = resources.borrow_and_update().clone();
-            let resources = resource_handle.state::<ResourceChannel>();
-            let mut channel = resources.channel.lock();
-            if let Some(current) = channel.as_ref()
-                && current.send(ModelResources::from(snapshot)).is_err()
-            {
-                channel.take();
-            }
+            resource_handle
+                .state::<ResourceChannel>()
+                .publish(ModelResources::from(snapshot));
         }
     }));
 

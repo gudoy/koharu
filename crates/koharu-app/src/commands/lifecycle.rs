@@ -107,33 +107,47 @@ pub struct ModelResources {
     pub devices: Vec<DeviceResources>,
 }
 
+/// Owns the resource subscriber and the last sample forwarded to it. The
+/// subscriber can arrive before the pipeline exists, so it never reads the
+/// pipeline's monitor directly.
 #[derive(Default)]
 pub(crate) struct ResourceChannel {
-    pub(crate) channel: Mutex<Option<Channel<ModelResources>>>,
+    subscription: Mutex<ResourceSubscription>,
+}
+
+#[derive(Default)]
+struct ResourceSubscription {
+    channel: Option<Channel<ModelResources>>,
+    latest: Option<ModelResources>,
 }
 
 impl ResourceChannel {
+    /// Records `resources` as the latest sample and forwards it.
+    pub(crate) fn publish(&self, resources: ModelResources) {
+        let mut subscription = self.subscription.lock();
+        if subscription
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.send(resources.clone()).is_err())
+        {
+            subscription.channel = None;
+        }
+        subscription.latest = Some(resources);
+    }
+
     /// Replaces the subscriber and sends it the latest sample. Samples are
     /// published only when they change, so a new subscriber would otherwise
-    /// see nothing until the next change.
-    fn replace(
-        &self,
-        channel: Channel<ModelResources>,
-        latest: &tokio::sync::watch::Receiver<koharu_pipeline::ResourceSnapshot>,
-    ) {
-        // Reading under the channel lock keeps a newer sample from being
-        // forwarded before this one.
-        let mut current = self.channel.lock();
-        let latest = latest.borrow().clone();
-        // The default snapshot means nothing has been sampled yet; the first
-        // sample differs from it and is forwarded when it arrives.
-        if latest != koharu_pipeline::ResourceSnapshot::default()
-            && channel.send(ModelResources::from(latest)).is_err()
+    /// see nothing until the next change. Sending under the lock keeps a newer
+    /// sample from being forwarded before this one.
+    fn replace(&self, channel: Channel<ModelResources>) {
+        let mut subscription = self.subscription.lock();
+        if let Some(latest) = &subscription.latest
+            && channel.send(latest.clone()).is_err()
         {
-            *current = None;
+            subscription.channel = None;
             return;
         }
-        *current = Some(channel);
+        subscription.channel = Some(channel);
     }
 }
 
@@ -189,12 +203,7 @@ pub(crate) async fn subscribe(
     *handle.state::<CanvasChannel>().channel.lock() = Some(on_canvas);
     *handle.state::<JobChannel>().channel.lock() = Some(on_job);
     *handle.state::<DownloadChannel>().channel.lock() = Some(on_download);
-    let latest = handle
-        .state::<koharu_pipeline::Pipeline>()
-        .subscribe_resources();
-    handle
-        .state::<ResourceChannel>()
-        .replace(on_resources, &latest);
+    handle.state::<ResourceChannel>().replace(on_resources);
     *handle.state::<ProjectChannel>().channel.lock() = Some(on_project);
 
     let canvas = handle.state::<Desktop>().canvas_state();
@@ -509,11 +518,11 @@ mod tests {
 
     #[test]
     fn a_new_subscriber_receives_the_latest_sample() {
-        let sample = koharu_pipeline::ResourceSnapshot {
-            system_memory_bytes: 1024,
+        let resources = ResourceChannel::default();
+        resources.publish(ModelResources {
+            system_memory: 1024,
             ..Default::default()
-        };
-        let (_monitor, latest) = tokio::sync::watch::channel(sample);
+        });
         let (sender, received) = std::sync::mpsc::channel();
         let subscriber = Channel::<ModelResources>::new(move |body| {
             if let InvokeResponseBody::Json(json) = body {
@@ -522,7 +531,7 @@ mod tests {
             Ok(())
         });
 
-        ResourceChannel::default().replace(subscriber, &latest);
+        resources.replace(subscriber);
 
         let received = received.try_iter().collect::<Vec<_>>();
         assert_eq!(received.len(), 1, "received {received:?}");
