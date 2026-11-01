@@ -32,6 +32,21 @@ impl StageRunner {
         })
     }
 
+    /// Builds the runner for a changed configuration. Unchanged stages keep
+    /// their processors and loaded models, and the runner keeps the same
+    /// accelerator lane.
+    pub(crate) fn reconfigure(
+        &self,
+        config: &PipelineConfig,
+        translator: koharu_translator::Translator,
+        device: &koharu_ml::Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            stages: self.stages.reconfigure(config, translator, device)?,
+            accelerator: self.accelerator.clone(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn shares_processor(&self, other: &Self, stage: Stage) -> bool {
         self.stages.shares_processor(&other.stages, stage)

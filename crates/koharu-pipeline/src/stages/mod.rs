@@ -70,10 +70,10 @@ trait StageProcessor: Send + Sync {
 }
 
 pub(crate) struct Stages {
-    detection: detection::Processor,
-    ocr: ocr::Processor,
+    detection: Arc<detection::Processor>,
+    ocr: Arc<ocr::Processor>,
     translation: translation::Processor,
-    inpainting: inpainting::Processor,
+    inpainting: Arc<inpainting::Processor>,
 }
 
 impl Stages {
@@ -83,19 +83,47 @@ impl Stages {
         device: &koharu_ml::Device,
     ) -> Result<Self> {
         Ok(Self {
-            detection: detection::Processor::new(config.detection()?, device.clone()),
-            ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
+            detection: Arc::new(detection::Processor::new(
+                config.detection()?,
+                device.clone(),
+            )),
+            ocr: Arc::new(ocr::Processor::new(config.ocr.clone(), device.clone())),
             translation: translation::Processor::new(config.translation.clone(), translator),
-            inpainting: inpainting::Processor::new(config.inpainting()?, device.clone())?,
+            inpainting: Arc::new(inpainting::Processor::new(
+                config.inpainting()?,
+                device.clone(),
+            )?),
         })
+    }
+
+    /// Builds the stages for `config`, keeping every processor whose settings
+    /// are unchanged so its loaded model survives the reload. Translation is
+    /// always rebuilt: its model lives in the shared translator.
+    pub(crate) fn reconfigure(
+        &self,
+        config: &PipelineConfig,
+        translator: koharu_translator::Translator,
+        device: &koharu_ml::Device,
+    ) -> Result<Self> {
+        let mut next = Self::new(config, translator, device)?;
+        if next.detection.config == self.detection.config {
+            next.detection = self.detection.clone();
+        }
+        if next.ocr.config == self.ocr.config {
+            next.ocr = self.ocr.clone();
+        }
+        if next.inpainting.config == self.inpainting.config {
+            next.inpainting = self.inpainting.clone();
+        }
+        Ok(next)
     }
 
     fn processor(&self, stage: Stage) -> &dyn StageProcessor {
         match stage {
-            Stage::Detection => &self.detection,
-            Stage::Ocr => &self.ocr,
+            Stage::Detection => self.detection.as_ref(),
+            Stage::Ocr => self.ocr.as_ref(),
             Stage::Translation => &self.translation,
-            Stage::Inpainting => &self.inpainting,
+            Stage::Inpainting => self.inpainting.as_ref(),
         }
     }
 

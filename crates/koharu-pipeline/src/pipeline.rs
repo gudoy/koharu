@@ -40,19 +40,15 @@ impl Pipeline {
         };
         let current = Arc::new(ArcSwap::from_pointee(runner));
         let watched = current.clone();
-        let watched_resources = resources.clone();
         let _watcher = tokio::runtime::Handle::try_current()
             .context("pipeline requires a Tokio runtime")?
             .spawn(async move {
                 let mut changes = config.subscribe();
                 while changes.changed().await.is_ok() {
                     let runner = config.read().and_then(|value| {
-                        StageRunner::new(
-                            &value,
-                            translator.clone(),
-                            &device,
-                            watched_resources.clone(),
-                        )
+                        watched
+                            .load()
+                            .reconfigure(&value, translator.clone(), &device)
                     });
                     match runner {
                         Ok(runner) => watched.store(Arc::new(runner)),

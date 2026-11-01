@@ -58,7 +58,7 @@ pub struct KoharuLayoutRFDetrSeg2XLConfig {
 }
 
 pub(super) struct Processor {
-    config: DetectionModel,
+    pub(super) config: DetectionModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }
