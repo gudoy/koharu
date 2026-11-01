@@ -205,3 +205,30 @@ opt-level = 3
 
 [profile.dev.package.libwebp-sys]
 opt-level = 3
+
+# A package override does not reach its dependencies, so the codec crates that
+# `image` calls into need their own: PNG unfiltering, inflate, deflate,
+# checksums and JPEG decode.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
