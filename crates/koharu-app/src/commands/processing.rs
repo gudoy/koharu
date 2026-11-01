@@ -68,7 +68,25 @@ pub enum JobState {
 pub(crate) struct Processing {
     pub(crate) stops: Mutex<HashMap<JobId, StopToken>>,
     pub(crate) jobs: Mutex<HashMap<JobId, Job>>,
-    pub(crate) inpainting_mask: Mutex<Option<koharu_pipeline::InpaintingMask>>,
+}
+
+impl Processing {
+    /// Stops every job and returns its terminal update. A job task that ends
+    /// later finds no entry and publishes nothing, so the caller must publish
+    /// these updates.
+    pub(crate) fn stop_all(&self) -> Vec<Job> {
+        for (_, stop) in self.stops.lock().drain() {
+            stop.stop();
+        }
+        self.jobs
+            .lock()
+            .drain()
+            .map(|(_, mut job)| {
+                job.state = JobState::Stopped;
+                job
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -83,16 +101,19 @@ pub(crate) async fn process(
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
 ) -> std::result::Result<JobId, Error> {
-    let (id, _) = start(&handle, scope, operation).await?;
+    let (id, _) = start(&handle, scope, operation, None).await?;
     Ok(id)
 }
 
 /// Starts a pipeline job. The returned task resolves to the job's terminal
-/// state once the run has published its final update.
+/// state once the run has published its final update. The inpainting mask
+/// belongs to this job only, so a rejected start cannot leave it for a later
+/// run.
 pub(crate) async fn start(
     handle: &AppHandle<CefRuntime>,
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
+    inpainting_mask: Option<koharu_pipeline::InpaintingMask>,
 ) -> Result<(JobId, JoinHandle<(JobState, Option<String>)>)> {
     let project = handle.state::<CurrentProject>();
     let processing = handle.state::<Processing>();
@@ -132,7 +153,6 @@ pub(crate) async fn start(
     job_channel.channel.publish(job);
 
     let task_handle = handle.clone();
-    let inpainting_mask = processing.inpainting_mask.lock().take();
     let task = tokio::spawn(async move {
         let progress = Arc::new(Mutex::new((0_usize, 0_usize)));
         let progress_handle = task_handle.clone();
@@ -308,4 +328,45 @@ pub(crate) async fn stop_job(
         .with_context(|| format!("job {job} is not running"))?;
     stop.stop();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use koharu_pipeline::StopToken;
+
+    use super::{Job, JobId, JobState, Processing};
+
+    #[test]
+    fn stopping_all_jobs_reports_a_waiting_job_as_stopped() {
+        let processing = Processing::default();
+        let id = JobId::new();
+        let stop = StopToken::default();
+        processing.stops.lock().insert(id, stop.clone());
+        processing.jobs.lock().insert(
+            id,
+            Job {
+                id,
+                state: JobState::Waiting,
+                completed: 0,
+                total: 0,
+                page: None,
+                stage: None,
+                model: None,
+                error: None,
+            },
+        );
+
+        let stopped = processing.stop_all();
+
+        assert!(stop.stopped());
+        assert!(processing.stops.lock().is_empty());
+        assert!(processing.jobs.lock().is_empty());
+        assert_eq!(
+            stopped
+                .iter()
+                .map(|job| (job.id, job.state))
+                .collect::<Vec<_>>(),
+            [(id, JobState::Stopped)]
+        );
+    }
 }

@@ -205,12 +205,9 @@ pub(crate) async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Proj
     let info = opened.info();
 
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    for job in handle.state::<Processing>().stop_all() {
+        handle.state::<JobChannel>().channel.publish(job);
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
 
     let previous = {
         let current = handle.state::<CurrentProject>();
@@ -331,12 +328,9 @@ pub(crate) async fn delete_project(
 
 async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    for job in handle.state::<Processing>().stop_all() {
+        handle.state::<JobChannel>().channel.publish(job);
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;

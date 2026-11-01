@@ -217,6 +217,7 @@ async fn translate(
         handle,
         koharu_pipeline::Scope::Project,
         koharu_pipeline::Operation::Full,
+        None,
     )
     .await?;
     match task.await.context("processing task failed")? {
