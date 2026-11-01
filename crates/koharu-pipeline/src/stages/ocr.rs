@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::{StageInput, StageProcessor, finish, generation};
-use crate::{ModelCell, OcrModel, scope::geometry_extents};
+use crate::{ModelCell, OcrModel, StopToken, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use image::DynamicImage;
@@ -140,27 +140,28 @@ impl Model {
             }
         }
 
+        let stop = input.stop.clone();
         let results = match self {
             Self::Manga(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Baberu(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Hayai(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Paddle(model) => {
-                infer_text(model.clone(), targets, |model, image| {
+                infer_text(model.clone(), targets, stop, |model, image| {
                     Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
                 })
                 .await?
@@ -226,6 +227,7 @@ struct OcrResult {
 async fn infer_text<M: Send + 'static>(
     model: Arc<Mutex<M>>,
     targets: Vec<OcrTarget>,
+    _stop: StopToken,
     inference: impl Fn(&M, &DynamicImage) -> Result<String> + Send + Sync + 'static,
 ) -> Result<Vec<OcrResult>> {
     tokio_rayon::spawn(move || {

@@ -101,6 +101,7 @@ impl Translator {
         selection: &ModelSelection,
         generation: GenerationConfig,
         mut request: TranslationRequest,
+        stopped: impl Fn() -> bool + Send + Sync + 'static,
     ) -> anyhow::Result<(&'static str, Vec<String>)> {
         let provider = selection.provider;
         let provider_id: &'static str = provider.into();
@@ -120,11 +121,15 @@ impl Translator {
         let translated = if provider == Provider::Local {
             self.local(selection)
                 .await?
-                .translate(request, generation)
+                .translate(request, generation, stopped)
                 .await?
         } else {
             let providers = self.providers.read()?.clone();
-            remote::translate(&self.client, &providers, selection, &generation, &request).await?
+            unless_stopped(
+                remote::translate(&self.client, &providers, selection, &generation, &request),
+                &stopped,
+            )
+            .await?
         };
         if translated.len() != expected {
             return Err(Error::SegmentCount {
@@ -174,6 +179,13 @@ impl Translator {
                 .translator,
         ))
     }
+}
+
+async fn unless_stopped<T>(
+    request: impl Future<Output = Result<T>>,
+    _stopped: &impl Fn() -> bool,
+) -> Result<T> {
+    request.await
 }
 
 #[cfg(test)]

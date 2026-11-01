@@ -7,7 +7,7 @@ use anyhow::Result;
 use koharu_scene::{EntityId, Patch};
 
 use crate::{
-    ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage, StopToken,
+    ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage,
     accelerator::AcceleratorGate,
     progress,
     resources::ResourceMonitor,
@@ -72,7 +72,7 @@ impl StageRunner {
         job: &StageJob,
         model: &str,
     ) -> std::result::Result<StageOutcome, PipelineError> {
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         let skip = self.stages.skip(job.stage, &job.input).map_err(|error| {
@@ -89,20 +89,20 @@ impl StageRunner {
             return Ok(StageOutcome::Skipped);
         }
         let permit = self.accelerator.acquire().await;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         let first = self.load_and_process(job, model).await;
         let failure = match first {
             Ok(outcome) => return Ok(outcome),
-            Err(failure) if is_out_of_memory(&failure.error) && !job.stop.stopped() => failure,
+            Err(failure) if is_out_of_memory(&failure.error) && !job.input.stopped() => failure,
             Err(failure) => return Err(self.stage_error(job.stage, model, failure)),
         };
 
         drop(permit);
         tracing::warn!(stage = %job.stage, page = %job.input.page(), error = %failure.error, "retrying stage after memory pressure");
         let _permit = self.accelerator.recover(job.stage, &self.stages).await;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         match self.load_and_process(job, model).await {
@@ -131,7 +131,7 @@ impl StageRunner {
                 kind: ErrorKind::ModelLoad,
                 error,
             })?;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         progress::emit(
@@ -185,21 +185,14 @@ fn is_out_of_memory(error: &anyhow::Error) -> bool {
 pub(crate) struct StageJob {
     stage: Stage,
     input: StageInput,
-    stop: StopToken,
     progress: Option<ProgressSink>,
 }
 
 impl StageJob {
-    pub(crate) fn new(
-        stage: Stage,
-        input: StageInput,
-        stop: StopToken,
-        progress: Option<ProgressSink>,
-    ) -> Self {
+    pub(crate) fn new(stage: Stage, input: StageInput, progress: Option<ProgressSink>) -> Self {
         Self {
             stage,
             input,
-            stop,
             progress,
         }
     }

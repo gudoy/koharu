@@ -12,7 +12,7 @@ use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
 
-use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, Stage};
+use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, Stage, StopToken};
 
 #[derive(Clone)]
 pub(crate) struct StageInput {
@@ -22,6 +22,7 @@ pub(crate) struct StageInput {
     region: Option<Bounds>,
     images: Arc<ImageCache>,
     inpainting_mask: Option<InpaintingMask>,
+    stop: StopToken,
 }
 
 impl StageInput {
@@ -32,6 +33,7 @@ impl StageInput {
         region: Option<Bounds>,
         images: Arc<ImageCache>,
         inpainting_mask: Option<InpaintingMask>,
+        stop: StopToken,
     ) -> Self {
         Self {
             scene,
@@ -40,11 +42,16 @@ impl StageInput {
             region,
             images,
             inpainting_mask,
+            stop,
         }
     }
 
     pub(crate) fn page(&self) -> EntityId {
         self.page
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.stopped()
     }
 
     fn contains_entity(&self, entity: EntityId) -> Result<bool> {

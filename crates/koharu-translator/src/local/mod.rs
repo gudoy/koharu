@@ -57,6 +57,7 @@ impl LocalTranslator {
         &self,
         request: TranslationRequest,
         generation: GenerationConfig,
+        _stopped: impl Fn() -> bool + Send + 'static,
     ) -> Result<Vec<String>> {
         let expected = request.segments.len();
         if expected == 0 {
