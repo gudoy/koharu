@@ -205,6 +205,7 @@ async fn main() -> Result<()> {
     let render_started = Instant::now();
     let snapshot = session.snapshot();
     let frame = renderer.render(&snapshot, page).await?;
+    let frame = renderer.decode_rasters(&frame).await?;
     let rasterizer = Rasterizer::new()?;
     let raster = rasterizer.rasterize(&frame.raster_frame()?, RasterOptions::default())?;
     let render_elapsed = render_started.elapsed();

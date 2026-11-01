@@ -112,6 +112,7 @@ pub(crate) async fn write(
             async move {
                 // One prepared frame and its composite feed every format.
                 let frame = renderer.render(snapshot, page).await?;
+                let frame = renderer.decode_rasters(&frame).await?;
                 let mut merged = Some(
                     rasterize(Arc::clone(&rasterizer), &frame, RasterOptions::default())
                         .await?
@@ -245,6 +246,7 @@ pub(crate) async fn rendered_preview(
 ) -> Result<Vec<u8>> {
     snapshot.page(page)?;
     let frame = renderer.render(snapshot, page).await?;
+    let frame = renderer.decode_rasters(&frame).await?;
     let image = rasterize(rasterizer, &frame, RasterOptions::default())
         .await?
         .image;

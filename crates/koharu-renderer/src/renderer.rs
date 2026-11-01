@@ -40,7 +40,7 @@ use crate::{
         FrameData, ImageNodeDescriptor, LayerData, LocalTextMetadata, NodeDescriptor, RetainedNode,
         prepare_frame,
     },
-    images::{DecodedImage, ImageCache, decode},
+    images::{EncodedImage, ImageCache, decode, probe},
     script::{is_chinese_or_japanese_text, shaping_direction_for_text},
     text_renderer::{StrokeOptions, TextNodeDescriptor, TextRenderer},
 };
@@ -48,8 +48,8 @@ use crate::{
 const MAX_SURFACE_DIMENSION: u32 = 32_768;
 const MAX_SURFACE_PIXELS: u64 = 268_435_456;
 const DEFAULT_RETAINED_NODES: usize = 2_048;
-/// Image nodes pin their decoded pixels, so the entry count alone lets a long
-/// session retain every page it has rendered. Pixels shared with the image
+/// Image nodes pin their encoded bytes, so the entry count alone lets a long
+/// session retain every page it has rendered. Bytes shared with the image
 /// cache or another node are counted per node, so this is an upper bound.
 const DEFAULT_RETAINED_NODE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCE_READS: usize = 8;
@@ -159,6 +159,40 @@ impl Renderer {
         let compiled = self.compile(snapshot, previous.page())?;
         self.finish(snapshot, compiled, Some(previous), Some(&affected))
             .await
+    }
+
+    /// Returns `frame` with the RGBA of its raster layers decoded for native
+    /// rasterization. Presentation keeps encoded bytes only; the decoded pixels
+    /// belong to the returned frame and its crops and are never cached.
+    #[tracing::instrument(level = "info", skip_all, fields(page = %frame.page()))]
+    pub async fn decode_rasters(&self, frame: &Frame) -> Result<Frame> {
+        let mut pending = HashMap::new();
+        for image in frame
+            .layers()
+            .iter()
+            .filter_map(|layer| layer.raster_image())
+        {
+            if image.pixels.is_none() {
+                pending
+                    .entry(image.source)
+                    .or_insert_with(|| (image.blob, image.encoded.clone(), image.size()));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(frame.clone());
+        }
+        let decoded = self
+            .workers()?
+            .spawn_async(move || {
+                pending
+                    .into_par_iter()
+                    .map(|(source, (blob, encoded, size))| {
+                        decode(blob, &encoded, size).map(|pixels| (source, pixels))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()
+            })
+            .await?;
+        Ok(frame.with_raster_pixels(&decoded))
     }
 
     pub async fn available_fonts(&self) -> Result<Vec<FontFamily>> {
@@ -369,7 +403,7 @@ impl Renderer {
         &self,
         snapshot: &Snapshot,
         ids: BTreeSet<BlobId>,
-    ) -> Result<HashMap<BlobId, Arc<DecodedImage>>> {
+    ) -> Result<HashMap<BlobId, Arc<EncodedImage>>> {
         let mut output = HashMap::with_capacity(ids.len());
         let mut missing = Vec::new();
         {
@@ -395,7 +429,7 @@ impl Renderer {
         &self,
         snapshot: &Snapshot,
         id: BlobId,
-    ) -> Result<(BlobId, Arc<DecodedImage>)> {
+    ) -> Result<(BlobId, Arc<EncodedImage>)> {
         let load = {
             let mut loads = self.inner.image_loads.lock();
             if let Some(load) = loads.get(&id).and_then(Weak::upgrade) {
@@ -424,7 +458,7 @@ impl Renderer {
             let bytes = snapshot.read_blob(id).await?;
             let bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
             let workers = self.workers()?;
-            let (id, image) = workers.spawn_async(move || decode(id, bytes, None)).await?;
+            let (id, image) = workers.spawn_async(move || probe(id, bytes)).await?;
             self.inner.images.lock().insert(id, image.clone());
             *load.image.lock() = Arc::downgrade(&image);
             Ok((id, image))
@@ -456,7 +490,7 @@ impl Default for Renderer {
 
 struct ImageLoad {
     lock: tokio::sync::Mutex<()>,
-    image: Mutex<Weak<DecodedImage>>,
+    image: Mutex<Weak<EncodedImage>>,
 }
 
 #[derive(Clone)]
@@ -1112,7 +1146,7 @@ fn image_draft(
 fn build_node(
     descriptor: NodeDescriptor,
     fonts: &Fonts,
-    images: &HashMap<BlobId, Arc<DecodedImage>>,
+    images: &HashMap<BlobId, Arc<EncodedImage>>,
 ) -> Result<RetainedNode> {
     match &descriptor {
         NodeDescriptor::Image(image) => {
@@ -1149,7 +1183,7 @@ fn build_node(
                 height: decoded.height,
                 media_type: image.media_type.clone(),
                 encoded: decoded.encoded.clone(),
-                pixels: decoded.pixels.clone(),
+                pixels: None,
             };
             Ok(RetainedNode {
                 descriptor,
@@ -1502,7 +1536,11 @@ impl NodeCache {
     /// the font cache, so only image nodes carry a page-sized cost.
     fn retained_bytes(node: &RetainedNode) -> usize {
         node.image.as_ref().map_or(0, |image| {
-            image.pixels.len().saturating_add(image.encoded.len())
+            image
+                .pixels
+                .as_ref()
+                .map_or(0, |pixels| pixels.len())
+                .saturating_add(image.encoded.len())
         })
     }
 
@@ -1833,11 +1871,10 @@ mod tests {
     }
 
     fn image_node(blob: BlobId, width: u32, height: u32) -> Arc<RetainedNode> {
-        let image = Arc::new(DecodedImage {
+        let image = Arc::new(EncodedImage {
             width,
             height,
-            encoded: Arc::from(vec![0_u8; 16]),
-            pixels: Arc::from(vec![0_u8; width as usize * height as usize * 4]),
+            encoded: Arc::from(vec![0_u8; width as usize * height as usize * 4]),
         });
         let descriptor = NodeDescriptor::Image(ImageNodeDescriptor {
             blob,
@@ -1850,8 +1887,8 @@ mod tests {
 
     #[test]
     fn retained_image_nodes_are_bounded_by_bytes() {
-        // Each node pins 4 KiB of pixels; the budget holds three of them.
-        let mut cache = NodeCache::new(2_048, 3 * (4 * 1024 + 16));
+        // Each node pins 4 KiB of encoded bytes; the budget holds three of them.
+        let mut cache = NodeCache::new(2_048, 3 * 4 * 1024);
         let page = EntityId::new();
         let entities = (0..8).map(|_| EntityId::new()).collect::<Vec<_>>();
         for (index, entity) in entities.iter().enumerate() {
@@ -1876,7 +1913,7 @@ mod tests {
         let clock = cache.next_clock();
         cache.insert(key, image_node(BlobId::for_bytes(b"b"), 16, 16), clock);
 
-        assert_eq!(cache.bytes, 16 * 16 * 4 + 16);
+        assert_eq!(cache.bytes, 16 * 16 * 4);
         cache.clear();
         assert_eq!(cache.bytes, 0);
     }

@@ -26,7 +26,8 @@ use crate::{
     writer::PsdWriter,
 };
 
-/// Builds a PSD for `frame`. `merged` is that frame rasterized with
+/// Builds a PSD for `frame`, which comes from `Renderer::decode_rasters` so
+/// its layer crops share one decode. `merged` is that frame rasterized with
 /// [`RasterOptions::default`], so an export writing several formats rasterizes
 /// the composite once for all of them.
 #[tracing::instrument(skip_all)]
