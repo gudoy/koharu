@@ -47,6 +47,7 @@ fn client(config: Config) -> Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(config.connect_timeout.max(1)))
+        .read_timeout(Duration::from_secs(config.read_timeout.max(1)))
         .http2_adaptive_window(true)
         .tcp_keepalive(Duration::from_secs(60))
         .build()
