@@ -9,6 +9,14 @@ enum WorkState {
     Pending,
     Running,
     Finished,
+    /// The stage failed, or a stage it depends on did. It never runs.
+    Failed,
+}
+
+impl WorkState {
+    fn ended(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed)
+    }
 }
 
 struct StageWork {
@@ -29,19 +37,22 @@ impl PageWork {
     }
 
     fn finished(&self) -> bool {
+        self.stages.iter().all(|work| work.state.ended())
+    }
+
+    fn state(&self, stage: Stage) -> Option<WorkState> {
         self.stages
             .iter()
-            .all(|work| work.state == WorkState::Finished)
+            .find(|work| work.stage == stage)
+            .map(|work| work.state)
     }
 
     fn ready(&self, index: usize) -> bool {
         let Some(prerequisite) = prerequisite(self.stages[index].stage) else {
             return true;
         };
-        self.stages
-            .iter()
-            .find(|work| work.stage == prerequisite)
-            .is_none_or(|work| work.state == WorkState::Finished)
+        self.state(prerequisite)
+            .is_none_or(|state| state == WorkState::Finished)
     }
 }
 
@@ -131,7 +142,43 @@ impl Scheduler {
         if let Some(work) = page.stages.iter_mut().find(|work| work.stage == stage) {
             work.state = WorkState::Finished;
         }
-        let page_finished = !was_finished && page.finished();
+        self.release_if_finished(page_index, was_finished)
+    }
+
+    /// Records that `stage` failed on `page` and abandons that page's pending
+    /// stages that depend on it, directly or transitively. Independent stages
+    /// of the page and every other page keep running. Returns the abandoned
+    /// stages and whether the page has now ended.
+    pub(crate) fn fail_stage(&mut self, page: EntityId, stage: Stage) -> (Vec<Stage>, bool) {
+        let Some(&page_index) = self.page_index.get(&page) else {
+            return (Vec::new(), false);
+        };
+        let page = &mut self.pages[page_index];
+        let was_finished = page.finished();
+        if let Some(work) = page.stages.iter_mut().find(|work| work.stage == stage) {
+            work.state = WorkState::Failed;
+        }
+        let mut abandoned = Vec::new();
+        loop {
+            let blocked = page.stages.iter().position(|candidate| {
+                candidate.state == WorkState::Pending
+                    && prerequisite(candidate.stage)
+                        .and_then(|prerequisite| page.state(prerequisite))
+                        == Some(WorkState::Failed)
+            });
+            let Some(index) = blocked else {
+                break;
+            };
+            page.stages[index].state = WorkState::Failed;
+            abandoned.push(page.stages[index].stage);
+        }
+        let page_finished = self.release_if_finished(page_index, was_finished);
+        (abandoned, page_finished)
+    }
+
+    /// Frees the page's window slot once all of its stages have ended.
+    fn release_if_finished(&mut self, page_index: usize, was_finished: bool) -> bool {
+        let page_finished = !was_finished && self.pages[page_index].finished();
         if page_finished {
             self.active_pages = self.active_pages.saturating_sub(1);
             while self.head < self.pages.len() && self.pages[self.head].finished() {
@@ -216,5 +263,43 @@ mod tests {
         assert!(scheduler.complete_stage(pages[0], Stage::Inpainting));
         busy.clear();
         assert_eq!(scheduler.start_next(&busy), Some((pages[1], Stage::Ocr)));
+    }
+
+    #[test]
+    fn a_failed_stage_abandons_only_its_dependents_on_that_page() {
+        let pages = pages(2);
+        let mut scheduler = Scheduler::new(&pages, &Stage::ALL);
+        let busy = BTreeSet::new();
+
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Detection))
+        );
+        assert!(!scheduler.complete_stage(pages[0], Stage::Detection));
+        assert_eq!(scheduler.start_next(&busy), Some((pages[0], Stage::Ocr)));
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[0], Stage::Inpainting))
+        );
+
+        // Translation depends on OCR; inpainting is already running and does not.
+        assert_eq!(
+            scheduler.fail_stage(pages[0], Stage::Ocr),
+            (vec![Stage::Translation], false)
+        );
+        assert!(scheduler.complete_stage(pages[0], Stage::Inpainting));
+
+        assert_eq!(
+            scheduler.start_next(&busy),
+            Some((pages[1], Stage::Detection))
+        );
+        assert_eq!(
+            scheduler.fail_stage(pages[1], Stage::Detection),
+            (
+                vec![Stage::Ocr, Stage::Translation, Stage::Inpainting],
+                true
+            )
+        );
+        assert!(scheduler.start_next(&busy).is_none());
     }
 }

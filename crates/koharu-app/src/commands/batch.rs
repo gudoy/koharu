@@ -34,6 +34,10 @@ pub(crate) const FORMATS: [ExportFormat; 2] = [ExportFormat::Psd, ExportFormat::
 enum Status {
     Running,
     Done,
+    /// Exported, but some pages failed a stage; `error` lists them. A rerun
+    /// skips the folder like a done one. Removing its entry retries only the
+    /// unfinished pages.
+    Partial,
     Failed,
     Stopped,
 }
@@ -53,7 +57,8 @@ pub struct Batch {
 }
 
 enum Outcome {
-    Done(usize),
+    /// Exported pages, and the failures of pages that could not be processed.
+    Done(usize, Option<String>),
     Stopped,
 }
 
@@ -128,7 +133,7 @@ pub(crate) async fn run(
             .to_owned();
         if report
             .get(&name)
-            .is_some_and(|entry| entry.status == Status::Done)
+            .is_some_and(|entry| matches!(entry.status, Status::Done | Status::Partial))
         {
             continue;
         }
@@ -142,15 +147,21 @@ pub(crate) async fn run(
         )?;
         tracing::info!(project = %name, "batch project started");
         match translate(handle, &folder, &name, &destination.join(&name)).await {
-            Ok(Outcome::Done(pages)) => {
-                tracing::info!(project = %name, pages, "batch project exported");
+            Ok(Outcome::Done(pages, failures)) => {
+                let status = if let Some(failures) = &failures {
+                    tracing::warn!(project = %name, pages, %failures, "batch project exported with failed pages");
+                    Status::Partial
+                } else {
+                    tracing::info!(project = %name, pages, "batch project exported");
+                    Status::Done
+                };
                 update(
                     &mut report,
                     &report_path,
                     &name,
-                    Status::Done,
+                    status,
                     Some(pages),
-                    None,
+                    failures,
                 )?;
             }
             Ok(Outcome::Stopped) => {
@@ -235,6 +246,7 @@ async fn translate(
             .snapshot(),
         &target,
     )?;
+    let mut failures = None;
     if !pending.is_empty() {
         let (_, task) = processing::start(
             handle,
@@ -242,13 +254,16 @@ async fn translate(
             koharu_pipeline::Operation::Full,
         )
         .await?;
-        match task.await.context("processing task failed")? {
-            (JobState::Stopped, _) => return Ok(Outcome::Stopped),
-            (JobState::Failed, error) => {
-                bail!(error.unwrap_or_else(|| "processing failed".to_owned()))
+        let end = task.await.context("processing task failed")?;
+        match end.state {
+            JobState::Stopped => return Ok(Outcome::Stopped),
+            // Failures confined to some pages still leave a project worth exporting.
+            JobState::Failed if end.failed_pages == 0 => {
+                bail!(end.error.unwrap_or_else(|| "processing failed".to_owned()))
             }
             _ => {}
         }
+        failures = end.error;
     }
 
     let snapshot = handle
@@ -263,7 +278,7 @@ async fn translate(
     fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
     let desktop = handle.state::<Desktop>();
     output::write(&desktop, snapshot, &FORMATS, output.to_owned()).await?;
-    Ok(Outcome::Done(pages))
+    Ok(Outcome::Done(pages, failures))
 }
 
 fn load_report(path: &Path) -> Result<BTreeMap<String, Entry>> {
