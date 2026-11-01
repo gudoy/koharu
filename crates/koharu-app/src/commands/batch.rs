@@ -320,8 +320,10 @@ fn pending_pages(snapshot: &Snapshot, target: &LanguageTag) -> Result<Vec<Entity
 /// stage itself reads the scene: a detected text region, source text on every
 /// content recognized from one, a translation in the target language for every
 /// non-blank source, and a cleanup layer with an image. User-authored text
-/// counts because no stage rewrites it. A page without detected text cannot be
-/// told apart from an unprocessed one, so it is not finished.
+/// counts because no stage rewrites it. A generated translation of a
+/// user-edited source does not: the scene does not record whether the edit came
+/// after it. A page without detected text cannot be told apart from an
+/// unprocessed one, so it is not finished.
 fn finished(snapshot: &Snapshot, page: EntityId, target: &LanguageTag) -> Result<bool> {
     let mut detected = false;
     for entity in snapshot.descendants(page)? {
@@ -347,15 +349,16 @@ fn finished(snapshot: &Snapshot, page: EntityId, target: &LanguageTag) -> Result
     if let Some(group) = snapshot.page(page)?.text_group()? {
         for layer in group.text_layers()? {
             let content = layer.content()?;
-            if content
-                .source()?
-                .is_none_or(|source| source.text.value.trim().is_empty())
-            {
+            let Some(source) = content.source()? else {
+                continue;
+            };
+            if source.text.value.trim().is_empty() {
                 continue;
             }
             let translated = content.translation()?.is_some_and(|translation| {
                 matches!(translation.text.origin, Origin::User)
-                    || translation.language.as_ref() == Some(target)
+                    || (!matches!(source.text.origin, Origin::User)
+                        && translation.language.as_ref() == Some(target))
             });
             if !translated {
                 return Ok(false);
