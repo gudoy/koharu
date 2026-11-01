@@ -9,6 +9,7 @@ import { usePages } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
 import { commands, type Download as DownloadState, type Job } from '@koharu/bridge/protocol'
 import { Button } from '@koharu/ui/components/button'
+import { cn } from '@koharu/ui/lib/utils'
 
 export function ActivityCenter() {
   const { t } = useTranslation()
@@ -128,7 +129,12 @@ function JobItem({ job }: { job: Job }) {
       <div className='grid grid-cols-[1rem_minmax(0,1fr)_2.25rem_1.5rem] items-start gap-x-2.5'>
         <span className='mt-1.5 size-1.5 justify-self-center rounded-full bg-primary' />
         <div className='min-w-0'>
-          <span className='block truncate text-[12px] font-medium capitalize'>
+          <span
+            className={cn(
+              'block truncate text-[12px] font-medium',
+              job.state !== 'waiting' && 'capitalize',
+            )}
+          >
             {job.state === 'waiting'
               ? t('startup.status')
               : job.stage

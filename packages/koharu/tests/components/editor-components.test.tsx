@@ -1967,7 +1967,9 @@ describe('greenfield editor', () => {
 
     // Checks the row uses the startup status key, whatever its wording.
     const activity = screen.getByRole('complementary', { name: 'Activity' })
-    expect(within(activity).getByText(translations.startup.status)).toBeInTheDocument()
+    const status = within(activity).getByText(translations.startup.status)
+    // The status is a sentence; title-casing it is only right for stage names.
+    expect(status).not.toHaveClass('capitalize')
     expect(screen.queryByRole('button', { name: 'Run processing' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Stop processing' }))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
