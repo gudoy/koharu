@@ -292,10 +292,12 @@ mod tests {
     use crate::{Operation, PipelineConfig, stages::StageProcessor};
 
     /// Adds one entity to its page. Each call takes longer than the one before, so two stages in
-    /// flight never finish at the same instant.
+    /// flight never finish at the same instant. The third call cannot finish before a commit is
+    /// pending, so that commit always overlaps a stage in flight regardless of timer jitter.
     struct Delayed {
         started: AtomicUsize,
         finished: tokio::sync::watch::Sender<usize>,
+        commit_pending: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -314,6 +316,9 @@ mod tests {
 
         async fn process(&self, input: StageInput) -> Result<Patch> {
             let call = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 3 {
+                self.commit_pending.notified().await;
+            }
             tokio::time::sleep(Duration::from_millis(50 * call as u64)).await;
             let patch = input.scene().patch(|edit| {
                 edit.add_entity(input.page(), At::End)?;
@@ -337,6 +342,7 @@ mod tests {
             let started = self.processor.started.load(Ordering::SeqCst);
             let mut finished = self.processor.finished.subscribe();
             if *finished.borrow() < started {
+                self.processor.commit_pending.notify_one();
                 let progressed = tokio::time::timeout(
                     Duration::from_secs(2),
                     finished.wait_for(|finished| *finished == started),
@@ -368,6 +374,7 @@ mod tests {
         let processor = Arc::new(Delayed {
             started: AtomicUsize::new(0),
             finished: tokio::sync::watch::channel(0).0,
+            commit_pending: tokio::sync::Notify::new(),
         });
         runner.set_test_processor(processor.clone());
         let mut session = Session::memory().await.unwrap();
