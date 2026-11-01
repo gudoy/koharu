@@ -26,16 +26,21 @@ use crate::{
     writer::PsdWriter,
 };
 
+/// Builds a PSD for `frame`. `merged` is that frame rasterized with
+/// [`RasterOptions::default`], so an export writing several formats rasterizes
+/// the composite once for all of them.
 #[tracing::instrument(skip_all)]
 pub async fn export_page(
     rasterizer: Arc<Rasterizer>,
     snapshot: &Snapshot,
     frame: &Frame,
+    merged: RgbaImage,
     options: &PsdExportOptions,
 ) -> Result<Vec<u8>, PsdExportError> {
     let document = crate::document::build(
         snapshot,
         frame,
+        merged,
         rasterizer,
         RasterOptions::default(),
         options,
