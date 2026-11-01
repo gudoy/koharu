@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "Hakkında",
+    "batch": "Klasörleri toplu çevir…",
     "closeProject": "Projeyi Kapat",
     "delete": "Seçilenleri Sil",
     "discord": "Discord",

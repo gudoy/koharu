@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "Koharuについて",
+    "batch": "フォルダーを一括翻訳…",
     "closeProject": "プロジェクトを閉じる",
     "delete": "選択項目を削除",
     "discord": "Discord",
