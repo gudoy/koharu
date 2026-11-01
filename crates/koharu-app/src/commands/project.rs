@@ -552,8 +552,15 @@ impl Project {
         if draft {
             let commit = self.session.stage(patch).await?;
             if self.staged.get_or_insert_with(Instant::now).elapsed() >= DRAFT_SAVE_INTERVAL {
-                self.session.persist().await?;
-                self.staged = None;
+                // The draft is already applied, so it must still reach the undo
+                // history. A failed save stays due: the next draft retries it,
+                // and the edit that ends the session reports it.
+                match self.session.persist().await {
+                    Ok(()) => self.staged = None,
+                    Err(error) => {
+                        tracing::warn!(error = format!("{error:#}"), "failed to save text drafts")
+                    }
+                }
             }
             return Ok(commit);
         }
@@ -1651,6 +1658,60 @@ mod tests {
         drop(project);
 
         let project = Project::open("drafts".to_owned(), path).await.unwrap();
+        let snapshot = project.snapshot();
+        let content = Project::text_content(&snapshot, layer).unwrap();
+        let translation = snapshot
+            .component::<SceneTranslation>(content)
+            .unwrap()
+            .map(|translation| translation.text.value);
+        assert_eq!(translation.as_deref(), Some("Hello"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_draft_save_keeps_the_draft_in_its_undo_step() {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+
+        // Like the text-edit commands, records only an edit that returns.
+        async fn edit(project: &mut Project, layer: EntityId, text: &str, draft: bool) {
+            if let Ok(commit) = project
+                .set_translation(layer, Some(text.to_owned()), draft)
+                .await
+            {
+                project.record_text_edit(layer, &commit, draft);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("drafts.khrproj");
+        let mut project = Project::create("drafts".to_owned(), path.clone())
+            .await
+            .unwrap();
+        let mut setup = project.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        project
+            .session
+            .commit(setup.finish().unwrap())
+            .await
+            .unwrap();
+        let (_, layer) = project
+            .add_point_text(page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        edit(&mut project, layer, "Hello", false).await;
+        edit(&mut project, layer, "Hi", true).await;
+
+        // The next draft is due for its periodic save, which the disk refuses.
+        project.staged = Some(Instant::now() - DRAFT_SAVE_INTERVAL);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+        edit(&mut project, layer, "Hi there", true).await;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(project.staged.is_some(), "the refused save stays due");
+        edit(&mut project, layer, "Hi there!", false).await;
+
+        project.undo().await.unwrap();
         let snapshot = project.snapshot();
         let content = Project::text_content(&snapshot, layer).unwrap();
         let translation = snapshot
