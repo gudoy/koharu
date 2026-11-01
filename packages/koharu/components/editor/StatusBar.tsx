@@ -1,5 +1,6 @@
 'use client'
 
+import { memo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { usePage } from '@/lib/queries'
@@ -10,7 +11,8 @@ interface StatusBarProps {
   onZoomChange: (zoom: number) => void
 }
 
-export function StatusBar({ onZoomChange }: StatusBarProps) {
+// Memoized because the workspace re-renders on every pointer move of a drag or stroke.
+export const StatusBar = memo(function StatusBar({ onZoomChange }: StatusBarProps) {
   const { t } = useTranslation()
   const page = usePage().data
   // Selects the displayed percentage so translation-only camera changes do not re-render the bar.
@@ -38,4 +40,4 @@ export function StatusBar({ onZoomChange }: StatusBarProps) {
       )}
     </footer>
   )
-}
+})

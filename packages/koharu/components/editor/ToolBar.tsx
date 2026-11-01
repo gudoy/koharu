@@ -11,6 +11,7 @@ import {
   Sparkles,
   Type,
 } from 'lucide-react'
+import { memo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ColorWell } from '@/components/controls/ColorWell'
@@ -49,7 +50,8 @@ const tools = [
   ['pan', Hand],
 ] as const satisfies ReadonlyArray<readonly [CanvasTool, typeof MousePointer2]>
 
-export function ToolBar() {
+// Memoized because the workspace re-renders on every pointer move of a drag or stroke.
+export const ToolBar = memo(function ToolBar() {
   const { t } = useTranslation()
   const page = usePage().data
   const active = useKoharuStore((state) => state.tool)
@@ -104,7 +106,7 @@ export function ToolBar() {
       )}
     </aside>
   )
-}
+})
 
 function BrushSize({ value, onChange }: { value: number; onChange: (value: number) => void }) {
   const { t } = useTranslation()
