@@ -500,6 +500,8 @@ function PageItem({
       onFocus={onIntent}
       onClick={(event) => {
         if ((event.target as HTMLElement).closest('button,[role="menuitem"]')) return
+        // Selecting the page opens it, so a pending hover prefetch is redundant.
+        cancelHoverIntent()
         onSelect(event.ctrlKey || event.metaKey, event.shiftKey)
       }}
       onDoubleClick={onRename}

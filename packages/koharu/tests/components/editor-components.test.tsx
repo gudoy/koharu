@@ -647,6 +647,30 @@ describe('greenfield editor', () => {
     expect(prefetch).not.toHaveBeenCalled()
   })
 
+  it('does not prefetch a page the pointer clicks before the hover intent fires', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      ...(queryClient.getQueryData<PageSummary[]>(pagesKey) ?? []),
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1500 },
+        source_asset: null,
+        layer_count: 0,
+      },
+    ])
+    const prefetch = vi.spyOn(canvasRuntime, 'prefetchCanvasPages').mockResolvedValue([])
+    vi.spyOn(commands, 'selectPage').mockResolvedValue(null)
+    render(<PageRail />)
+    const item = screen.getByText('Page 2').closest('article')!
+
+    fireEvent.pointerEnter(item)
+    fireEvent.click(item)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    expect(prefetch).not.toHaveBeenCalled()
+  })
+
   it('deduplicates page intent within a project revision and retries on a newer revision', async () => {
     installProject()
     const page = {
@@ -677,6 +701,8 @@ describe('greenfield editor', () => {
     fireEvent.focus(screen.getByRole('button', { name: 'Actions for Page 2' }))
     await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
     fireEvent.pointerEnter(item)
+    // Let the hover intent fire so the deduplication is what keeps the count.
+    await new Promise((resolve) => setTimeout(resolve, 200))
     expect(prefetch).toHaveBeenCalledTimes(1)
 
     queryClient.setQueryData(projectKey, {
