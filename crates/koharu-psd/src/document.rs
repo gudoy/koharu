@@ -247,10 +247,29 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), PsdExportError> {
     Ok(())
 }
 
+/// The prepared frame's Source layer holds the same decode of the page source
+/// asset, so the "Original Image" layer copies it instead of decoding the blob
+/// again. The blob is read only when the frame has no matching Source layer.
 async fn source_image(
     snapshot: &Snapshot,
     frame: &Frame,
 ) -> Result<Option<RgbaImage>, PsdExportError> {
+    let Some(asset) = snapshot.asset(frame.page(), &AssetRole::new(SOURCE_ROLE)?)? else {
+        return Ok(None);
+    };
+    let prepared = frame.layers().iter().find_map(|layer| match layer.kind() {
+        LayerKind::Image(image) if image.kind == ImageKind::Source => layer
+            .raster_image()
+            .filter(|raster| raster.blob() == asset.blob)
+            .and_then(|raster| {
+                let (width, height) = raster.size();
+                RgbaImage::from_raw(width, height, raster.pixels().to_vec())
+            }),
+        LayerKind::Image(_) | LayerKind::Text(_) => None,
+    });
+    if prepared.is_some() {
+        return Ok(prepared);
+    }
     Ok(read_image(snapshot, frame.page(), SOURCE_ROLE)
         .await?
         .map(|source| source.to_rgba8()))
@@ -392,7 +411,10 @@ fn text_metadata(index: i32, text: &RenderedText, font_set: &[String]) -> TextMe
 
 #[cfg(test)]
 mod tests {
-    use koharu_renderer::{RenderBounds, TextMetadata as RenderedText};
+    use std::{collections::BTreeMap, io::Cursor};
+
+    use koharu_renderer::{RenderBounds, Renderer, TextMetadata as RenderedText};
+    use koharu_scene::{AssetInput, AssetMetadata, At, PageDraft, Session};
 
     use super::*;
 
@@ -456,5 +478,56 @@ mod tests {
             error,
             PsdExportError::MismatchedMaskDimensions { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn source_layer_comes_from_the_prepared_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path()).await.unwrap();
+        let pixels = RgbaImage::from_fn(3, 2, |x, y| {
+            Rgba([x as u8 * 80, y as u8 * 120, 7, 100 + x as u8])
+        });
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(pixels.clone())
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let role = AssetRole::new(SOURCE_ROLE).unwrap();
+        let mut page = None;
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                let id = edit.add_page(PageDraft::new("page", 3.0, 2.0), At::End)?;
+                edit.set_asset(
+                    id,
+                    &role,
+                    AssetInput::new(
+                        png.into_inner(),
+                        "image/png",
+                        AssetMetadata {
+                            width: Some(3),
+                            height: Some(2),
+                            attributes: BTreeMap::new(),
+                        },
+                    ),
+                )?;
+                page = Some(id);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let frame = Renderer::default().render(&snapshot, page).await.unwrap();
+
+        // The frame already decoded the source; export must not need the blob again.
+        let blob = snapshot
+            .asset(page, &role)
+            .unwrap()
+            .unwrap()
+            .blob
+            .to_string();
+        std::fs::remove_file(directory.path().join("blobs").join(&blob[..2]).join(&blob)).unwrap();
+
+        let source = source_image(&snapshot, &frame).await.unwrap();
+        assert_eq!(source, Some(pixels));
     }
 }
