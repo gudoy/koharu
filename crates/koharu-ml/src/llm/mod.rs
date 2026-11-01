@@ -94,16 +94,19 @@ impl Llm {
         self.model.inference(input, options, None, on_token)
     }
 
-    /// Generates JSON constrained by the supplied JSON Schema.
-    pub fn inference_with_json_schema(
+    /// Generates JSON constrained by the supplied JSON Schema and invokes `on_token` after each
+    /// decoded token.
+    pub fn inference_with_json_schema<F>(
         &self,
         input: &Input<'_>,
         options: &GenerationOptions,
         schema: &serde_json::Value,
-    ) -> Result<Generation> {
-        self.model.inference(input, options, Some(schema), |_| {
-            Ok(GenerationControl::Continue)
-        })
+        on_token: F,
+    ) -> Result<Generation>
+    where
+        F: FnMut(TokenChunk<'_>) -> Result<GenerationControl>,
+    {
+        self.model.inference(input, options, Some(schema), on_token)
     }
 
     /// Generates and deserializes JSON constrained to the schema of `T`.
@@ -117,7 +120,9 @@ impl Llm {
     {
         let schema = serde_json::to_value(schemars::schema_for!(T))
             .context("failed to serialize structured output schema")?;
-        let generation = self.inference_with_json_schema(input, options, &schema)?;
+        let generation = self.inference_with_json_schema(input, options, &schema, |_| {
+            Ok(GenerationControl::Continue)
+        })?;
         let value = serde_json::from_str(generation.text.trim())
             .context("failed to deserialize structured LLM output")?;
         Ok(StructuredGeneration { value, generation })

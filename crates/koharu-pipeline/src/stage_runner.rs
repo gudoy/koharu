@@ -7,7 +7,7 @@ use anyhow::Result;
 use koharu_scene::{EntityId, Patch};
 
 use crate::{
-    ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage, StopToken,
+    ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage,
     accelerator::AcceleratorGate,
     progress,
     resources::ResourceMonitor,
@@ -52,6 +52,11 @@ impl StageRunner {
         self.stages.shares_processor(&other.stages, stage)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_processor(&mut self, processor: Arc<dyn crate::stages::StageProcessor>) {
+        self.stages.set_test_processor(processor);
+    }
+
     #[tracing::instrument(skip_all)]
     pub(crate) async fn run(&self, job: StageJob) -> StageCompletion {
         let started = Instant::now();
@@ -72,7 +77,7 @@ impl StageRunner {
         job: &StageJob,
         model: &str,
     ) -> std::result::Result<StageOutcome, PipelineError> {
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         let skip = self.stages.skip(job.stage, &job.input).map_err(|error| {
@@ -89,20 +94,20 @@ impl StageRunner {
             return Ok(StageOutcome::Skipped);
         }
         let permit = self.accelerator.acquire().await;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         let first = self.load_and_process(job, model).await;
         let failure = match first {
             Ok(outcome) => return Ok(outcome),
-            Err(failure) if is_out_of_memory(&failure.error) && !job.stop.stopped() => failure,
+            Err(failure) if is_out_of_memory(&failure.error) && !job.input.stopped() => failure,
             Err(failure) => return Err(self.stage_error(job.stage, model, failure)),
         };
 
         drop(permit);
         tracing::warn!(stage = %job.stage, page = %job.input.page(), error = %failure.error, "retrying stage after memory pressure");
         let _permit = self.accelerator.recover(job.stage, &self.stages).await;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         match self.load_and_process(job, model).await {
@@ -131,7 +136,7 @@ impl StageRunner {
                 kind: ErrorKind::ModelLoad,
                 error,
             })?;
-        if job.stop.stopped() {
+        if job.input.stopped() {
             return Ok(StageOutcome::Stopped);
         }
         progress::emit(
@@ -142,9 +147,13 @@ impl StageRunner {
                 model: model.to_owned(),
             },
         );
-        self.stages
-            .process(job.stage, job.input.clone())
-            .await
+        let processed = self.stages.process(job.stage, job.input.clone()).await;
+        // Processors end long work early on stop. Their partial result or error
+        // is discarded and must not count as a stage failure that unloads the model.
+        if job.input.stopped() {
+            return Ok(StageOutcome::Stopped);
+        }
+        processed
             .map(|patch| {
                 if patch.is_empty() {
                     StageOutcome::Skipped
@@ -185,21 +194,14 @@ fn is_out_of_memory(error: &anyhow::Error) -> bool {
 pub(crate) struct StageJob {
     stage: Stage,
     input: StageInput,
-    stop: StopToken,
     progress: Option<ProgressSink>,
 }
 
 impl StageJob {
-    pub(crate) fn new(
-        stage: Stage,
-        input: StageInput,
-        stop: StopToken,
-        progress: Option<ProgressSink>,
-    ) -> Self {
+    pub(crate) fn new(stage: Stage, input: StageInput, progress: Option<ProgressSink>) -> Self {
         Self {
             stage,
             input,
-            stop,
             progress,
         }
     }
@@ -221,10 +223,13 @@ pub(crate) struct StageCompletion {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use anyhow::Context as _;
     use koharu_llama::{DecodeError, LlamaContextLoadError, mtmd::MtmdEvalError};
 
-    use super::is_out_of_memory;
+    use super::*;
+    use crate::{ImageCache, StopToken, stages::StageProcessor};
 
     #[test]
     fn llama_cpp_allocation_failures_are_out_of_memory() {
@@ -250,5 +255,76 @@ mod tests {
 
         assert!(!is_out_of_memory(&invalid));
         assert!(!is_out_of_memory(&failed));
+    }
+
+    /// Simulates a processor whose long-running work ends early because the job was stopped.
+    struct Interrupted {
+        stop: StopToken,
+        unloads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StageProcessor for Interrupted {
+        fn model(&self) -> &'static str {
+            "interrupted"
+        }
+
+        fn unload(&self) -> bool {
+            self.unloads.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        async fn load(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn process(&self, _input: StageInput) -> Result<Patch> {
+            self.stop.stop();
+            anyhow::bail!("generation ended before its output was complete")
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_during_processing_keeps_the_model_loaded() {
+        let device = koharu_ml::Device::cpu();
+        let translator = koharu_translator::Translator::from_config(
+            device.clone(),
+            koharu_config::Config::memory(koharu_translator::ProvidersConfig::default()),
+        )
+        .unwrap();
+        let mut runner = StageRunner::new(
+            &PipelineConfig::default(),
+            translator,
+            &device,
+            ResourceMonitor::new(&device),
+        )
+        .unwrap();
+        let stop = StopToken::default();
+        let processor = Arc::new(Interrupted {
+            stop: stop.clone(),
+            unloads: AtomicUsize::new(0),
+        });
+        runner.set_test_processor(processor.clone());
+        let input = StageInput::new(
+            koharu_scene::Session::memory().await.unwrap().snapshot(),
+            EntityId::new(),
+            None,
+            None,
+            Arc::new(ImageCache::default()),
+            None,
+            stop,
+        );
+
+        let completion = runner.run(StageJob::new(Stage::Ocr, input, None)).await;
+
+        assert_eq!(
+            processor.unloads.load(Ordering::SeqCst),
+            0,
+            "stopping must not unload the stage model"
+        );
+        assert!(
+            matches!(completion.outcome, Ok(StageOutcome::Stopped)),
+            "a stop that interrupts processing is not a stage failure"
+        );
     }
 }

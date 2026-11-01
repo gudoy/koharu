@@ -974,6 +974,7 @@ mod tests {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
             }),
+            crate::StopToken::default(),
         );
 
         let prepared = prepare(&input).await.unwrap();
@@ -1028,6 +1029,7 @@ mod tests {
             None,
             Arc::new(crate::ImageCache::default()),
             None,
+            crate::StopToken::default(),
         );
         let manual = StageInput::new(
             snapshot,
@@ -1039,6 +1041,7 @@ mod tests {
                 page,
                 png: Arc::<[u8]>::from([]),
             }),
+            crate::StopToken::default(),
         );
         let processor = Processor::new(InpaintingModel::LaMa {}, koharu_ml::Device::cpu()).unwrap();
 

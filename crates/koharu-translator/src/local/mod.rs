@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use koharu_ml::llm::{
-    ChatMessage, ChatTemplateOptions, Input, Llm, LoadOptions, MtmdOptions, media_marker,
+    ChatMessage, ChatTemplateOptions, FinishReason, GenerationControl, Input, Llm, LoadOptions,
+    MtmdOptions, media_marker,
 };
 
 mod catalog;
@@ -57,6 +58,7 @@ impl LocalTranslator {
         &self,
         request: TranslationRequest,
         generation: GenerationConfig,
+        stopped: impl Fn() -> bool + Send + 'static,
     ) -> Result<Vec<String>> {
         let expected = request.segments.len();
         if expected == 0 {
@@ -86,9 +88,18 @@ impl LocalTranslator {
                 || Input::new(&prompt),
                 |image| Input::new(&prompt).with_image(image),
             );
-            llm.inference_with_json_schema(&input, &generation, &schema)
+            llm.inference_with_json_schema(&input, &generation, &schema, |_| {
+                Ok(if stopped() {
+                    GenerationControl::Stop
+                } else {
+                    GenerationControl::Continue
+                })
+            })
         })
         .await?;
+        if output.finish_reason == FinishReason::Callback {
+            return Err(Error::Stopped);
+        }
         let segments = prompt::translations("local", &output.text, &request.segments)?;
         Ok(segments)
     }
