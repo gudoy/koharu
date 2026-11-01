@@ -9,6 +9,7 @@ use koharu_scene::{EntityId, Patch};
 use crate::{
     ErrorKind, PipelineConfig, PipelineError, Progress, ProgressSink, Stage,
     accelerator::AcceleratorGate,
+    error::Stopped,
     progress,
     resources::ResourceMonitor,
     stages::{StageInput, Stages},
@@ -148,9 +149,14 @@ impl StageRunner {
             },
         );
         let processed = self.stages.process(job.stage, job.input.clone()).await;
-        // Processors end long work early on stop. Their partial result or error
+        // Processors end long work early on stop. Their partial result or stop error
         // is discarded and must not count as a stage failure that unloads the model.
-        if job.input.stopped() {
+        // Any other error is still a failure, even if Stop was pressed meanwhile.
+        let stopped = match &processed {
+            Ok(_) => job.input.stopped(),
+            Err(error) => is_stop(error),
+        };
+        if stopped {
             return Ok(StageOutcome::Stopped);
         }
         processed
@@ -180,6 +186,16 @@ impl StageRunner {
 struct AttemptFailure {
     kind: ErrorKind,
     error: anyhow::Error,
+}
+
+fn is_stop(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source.is::<Stopped>()
+            || matches!(
+                source.downcast_ref(),
+                Some(koharu_translator::Error::Stopped)
+            )
+    })
 }
 
 fn is_out_of_memory(error: &anyhow::Error) -> bool {
@@ -257,9 +273,10 @@ mod tests {
         assert!(!is_out_of_memory(&failed));
     }
 
-    /// Simulates a processor whose long-running work ends early because the job was stopped.
+    /// Simulates a processor that stops the job and then ends its work with `error`.
     struct Interrupted {
         stop: StopToken,
+        error: fn() -> anyhow::Error,
         unloads: AtomicUsize,
     }
 
@@ -280,12 +297,15 @@ mod tests {
 
         async fn process(&self, _input: StageInput) -> Result<Patch> {
             self.stop.stop();
-            anyhow::bail!("generation ended before its output was complete")
+            Err((self.error)())
         }
     }
 
-    #[tokio::test]
-    async fn stop_during_processing_keeps_the_model_loaded() {
+    /// Runs `stage` with [`Interrupted`] and returns the outcome and the number of model unloads.
+    async fn run_interrupted(
+        stage: Stage,
+        error: fn() -> anyhow::Error,
+    ) -> (std::result::Result<StageOutcome, PipelineError>, usize) {
         let device = koharu_ml::Device::cpu();
         let translator = koharu_translator::Translator::from_config(
             device.clone(),
@@ -302,6 +322,7 @@ mod tests {
         let stop = StopToken::default();
         let processor = Arc::new(Interrupted {
             stop: stop.clone(),
+            error,
             unloads: AtomicUsize::new(0),
         });
         runner.set_test_processor(processor.clone());
@@ -315,16 +336,36 @@ mod tests {
             stop,
         );
 
-        let completion = runner.run(StageJob::new(Stage::Ocr, input, None)).await;
+        let completion = runner.run(StageJob::new(stage, input, None)).await;
+        (completion.outcome, processor.unloads.load(Ordering::SeqCst))
+    }
 
-        assert_eq!(
-            processor.unloads.load(Ordering::SeqCst),
-            0,
-            "stopping must not unload the stage model"
-        );
+    #[tokio::test]
+    async fn stop_during_processing_keeps_the_model_loaded() {
+        let stops: [fn() -> anyhow::Error; 2] = [
+            || Stopped.into(),
+            || koharu_translator::Error::Stopped.into(),
+        ];
+        for stop in stops {
+            let (outcome, unloads) = run_interrupted(Stage::Ocr, stop).await;
+
+            assert_eq!(unloads, 0, "stopping must not unload the stage model");
+            assert!(
+                matches!(outcome, Ok(StageOutcome::Stopped)),
+                "a stop that interrupts processing is not a stage failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_after_stop_is_still_a_stage_failure() {
+        let (outcome, unloads) =
+            run_interrupted(Stage::Inpainting, || anyhow::anyhow!("inpainting failed")).await;
+
+        assert_eq!(unloads, 1, "a real failure must unload the stage model");
         assert!(
-            matches!(completion.outcome, Ok(StageOutcome::Stopped)),
-            "a stop that interrupts processing is not a stage failure"
+            outcome.is_err_and(|error| error.kind == ErrorKind::Processing),
+            "an error the stop did not cause is a stage failure"
         );
     }
 }

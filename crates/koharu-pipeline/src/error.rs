@@ -52,3 +52,16 @@ impl StdError for PipelineError {
         Some(self.source.as_ref())
     }
 }
+
+/// A processor ended its work early because the job was stopped. The runner tells this apart from
+/// a real failure that happens after Stop.
+#[derive(Debug)]
+pub(crate) struct Stopped;
+
+impl fmt::Display for Stopped {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("stage was stopped")
+    }
+}
+
+impl StdError for Stopped {}
