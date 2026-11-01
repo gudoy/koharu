@@ -100,6 +100,13 @@ impl Frame {
         self.0.stats
     }
 
+    /// Whether both frames present the same retained layers, which holds when an update found
+    /// nothing on the page affected and only moved the frame to a newer revision.
+    #[must_use]
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.0.page == other.0.page && Arc::ptr_eq(&self.0.layers, &other.0.layers)
+    }
+
     #[must_use]
     pub fn prepared(&self) -> &PreparedFrameBundle {
         &self.0.prepared
