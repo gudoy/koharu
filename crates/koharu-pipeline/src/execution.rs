@@ -5,8 +5,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use futures::{StreamExt as _, stream::FuturesUnordered};
 use koharu_scene::{EntityId, Snapshot};
+use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 use crate::{
     Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
@@ -99,16 +100,20 @@ impl<'a> Execution<'a> {
         self.resources.start();
         self.resources.wait_for_sample().await;
 
-        let runner = self.runner.clone();
-        let mut running = FuturesUnordered::new();
+        // Each stage runs as its own task so it keeps progressing while this loop awaits a
+        // commit. Commits stay serialized here. Dropping the set aborts the stages in flight.
+        let mut running = JoinSet::new();
         loop {
             while let Some(job) = self.take_ready_job() {
-                running.push(runner.run(job));
+                let runner = self.runner.clone();
+                running.spawn(async move { runner.run(job).await }.in_current_span());
             }
 
-            let Some(completion) = running.next().await else {
+            let Some(joined) = running.join_next().await else {
                 break;
             };
+            let completion =
+                joined.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
             self.busy_stages.remove(&completion.stage);
             if self.stopped() || self.failure.is_some() {
                 continue;
