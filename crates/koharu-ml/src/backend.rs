@@ -45,6 +45,12 @@ impl TryIntoDevice<koharu_torch::Device> for Device {
     }
 }
 
+/// Precision for the default detector and inpainter, which keep their
+/// results within comparison tolerance in bfloat16.
+pub(crate) fn set_reduced_precision(var_store: &mut nn::VarStore) {
+    set_precision(var_store);
+}
+
 pub(crate) fn set_precision(var_store: &mut nn::VarStore) {
     let hardware = Hardware::discover();
     let device_supports_bfloat16 = hardware
@@ -71,5 +77,20 @@ pub(crate) fn set_precision(var_store: &mut nn::VarStore) {
         var_store.bfloat16();
     } else {
         var_store.float();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires the dynamically loaded LibTorch runtime and an Apple GPU"]
+    async fn reduced_precision_uses_bfloat16_on_metal() -> anyhow::Result<()> {
+        crate::init().await?;
+        let mut var_store = nn::VarStore::new(koharu_torch::Device::Mps);
+        set_reduced_precision(&mut var_store);
+        assert_eq!(var_store.kind(), Kind::BFloat16);
+        Ok(())
     }
 }
