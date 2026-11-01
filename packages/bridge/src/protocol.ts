@@ -261,7 +261,7 @@ export type Job = {
 
 export type JobId = string;
 
-export type JobState = "running" | "finished" | "failed" | "stopped";
+export type JobState = "waiting" | "running" | "finished" | "failed" | "stopped";
 
 export type KoharuLayoutRFDetrSeg2XLConfig = {
 	text_threshold?: number | null,

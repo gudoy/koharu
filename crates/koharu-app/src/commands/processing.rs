@@ -54,6 +54,7 @@ pub struct Job {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
+    Waiting,
     Running,
     Finished,
     Failed,

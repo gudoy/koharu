@@ -69,6 +69,12 @@ impl Initialization {
         }
         Ok(())
     }
+
+    pub(crate) fn failed(&self, _error: &anyhow::Error) {}
+
+    pub(crate) async fn wait_unless(&self, _stop: &koharu_pipeline::StopToken) -> Result<bool> {
+        self.wait().await.map(|()| true)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Type)]
@@ -469,4 +475,59 @@ pub(crate) async fn select_page(
         project: project_info,
         page: selected_page,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use koharu_pipeline::StopToken;
+
+    use super::Initialization;
+
+    #[tokio::test]
+    async fn processing_waits_for_the_runtime_unless_stopped() {
+        let initialization = Initialization::default();
+        let stop = StopToken::default();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                initialization.wait_unless(&stop)
+            )
+            .await
+            .is_err(),
+            "processing must wait for runtime initialization"
+        );
+
+        stop.stop();
+        let ready = tokio::time::timeout(Duration::from_secs(2), initialization.wait_unless(&stop))
+            .await
+            .expect("a stop request must end the wait for the runtime")
+            .unwrap();
+        assert!(!ready);
+
+        initialization.ready();
+        let ready = tokio::time::timeout(
+            Duration::from_secs(2),
+            initialization.wait_unless(&StopToken::default()),
+        )
+        .await
+        .expect("an initialized runtime must not be waited for")
+        .unwrap();
+        assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn processing_reports_a_runtime_that_failed_to_initialize() {
+        let initialization = Initialization::default();
+        initialization.failed(&anyhow::anyhow!("runtime download failed"));
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            initialization.wait_unless(&StopToken::default()),
+        )
+        .await
+        .expect("a failed runtime must not be waited for")
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("runtime download failed"));
+    }
 }

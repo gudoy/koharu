@@ -1939,6 +1939,36 @@ describe('greenfield editor', () => {
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
   })
 
+  it('shows processing that waits for the local runtimes and keeps it stoppable', async () => {
+    installProject()
+    useKoharuStore.setState({
+      jobs: {
+        job: {
+          state: 'waiting',
+          id: 'job',
+          completed: 0,
+          total: 0,
+          page: null,
+          stage: null,
+          model: null,
+          error: null,
+        },
+      },
+    })
+    const stop = vi.spyOn(commands, 'stopJob').mockResolvedValue(null)
+    render(
+      <>
+        <CanvasCommandBar />
+        <ActivityCenter />
+      </>,
+    )
+
+    expect(screen.getByText('Initializing local runtimes')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run processing' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop processing' }))
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
+  })
+
   it('combines concurrent downloads into one progress bar', () => {
     useKoharuStore.setState({
       downloads: {
