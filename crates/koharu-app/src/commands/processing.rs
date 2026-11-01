@@ -60,6 +60,14 @@ pub enum JobState {
     Stopped,
 }
 
+/// How a pipeline job ended. A job whose failures stayed confined to their
+/// pages is `Failed` with `failed_pages > 0`; every other page was processed.
+pub(crate) struct JobEnd {
+    pub(crate) state: JobState,
+    pub(crate) error: Option<String>,
+    pub(crate) failed_pages: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct Processing {
     pub(crate) stops: Mutex<HashMap<JobId, StopToken>>,
@@ -89,7 +97,7 @@ pub(crate) async fn start(
     handle: &AppHandle<CefRuntime>,
     scope: koharu_pipeline::Scope,
     operation: koharu_pipeline::Operation,
-) -> Result<(JobId, JoinHandle<(JobState, Option<String>)>)> {
+) -> Result<(JobId, JoinHandle<JobEnd>)> {
     let project = handle.state::<CurrentProject>();
     let processing = handle.state::<Processing>();
     let job_channel = handle.state::<JobChannel>();
@@ -157,6 +165,18 @@ pub(crate) async fn start(
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), None))
                 }
+                Progress::Failed {
+                    page,
+                    stage,
+                    abandoned,
+                } => {
+                    let mut progress = progress.lock();
+                    progress.0 = progress
+                        .0
+                        .saturating_add(1 + abandoned.len())
+                        .min(progress.1);
+                    Some((progress.0, progress.1, Some(page), Some(stage), None))
+                }
                 Progress::Running { .. } => None,
             };
             if let Some((completed, total, page, stage, model)) = update {
@@ -208,12 +228,39 @@ pub(crate) async fn start(
         let mut committer = PipelineCommitter {
             handle: task_handle.clone(),
         };
+        let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
         let result = pipeline.execute(snapshot, request, &mut committer).await;
-        let (stopped, error) = match result {
-            Ok(report) => (report.status == RunStatus::Stopped, None),
+        let (stopped, error, failed_pages) = match result {
+            Ok(report) => {
+                let error = (!report.failures.is_empty()).then(|| {
+                    report
+                        .failures
+                        .iter()
+                        .map(|failure| {
+                            let number = pages
+                                .iter()
+                                .position(|page| *page == failure.page)
+                                .map_or_else(
+                                    || failure.page.to_string(),
+                                    |index| (index + 1).to_string(),
+                                );
+                            format!("page {number}: {:#}", failure.error)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+                if let Some(error) = &error {
+                    tracing::error!(pages = report.failures.len(), %error, "processing failed on some pages");
+                }
+                (
+                    report.status == RunStatus::Stopped,
+                    error,
+                    report.failures.len(),
+                )
+            }
             Err(error) => {
                 tracing::error!(stage = ?error.stage, %error, "processing failed");
-                (false, Some(format!("{error:#}")))
+                (false, Some(format!("{error:#}")), 0)
             }
         };
         task_handle.state::<Processing>().stops.lock().remove(&id);
@@ -237,7 +284,11 @@ pub(crate) async fn start(
         if let Some(job) = job {
             task_handle.state::<JobChannel>().channel.publish(job);
         }
-        (state, error)
+        JobEnd {
+            state,
+            error,
+            failed_pages,
+        }
     });
     Ok((id, task))
 }

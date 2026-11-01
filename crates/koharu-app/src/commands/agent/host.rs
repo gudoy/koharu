@@ -172,6 +172,15 @@ impl KoharuHost {
             "completed": report.completed,
             "total": report.total,
             "elapsed_ms": report.elapsed.as_millis(),
+            "failures": report
+                .failures
+                .iter()
+                .map(|failure| json!({
+                    "page": failure.page,
+                    "stage": failure.error.stage,
+                    "error": format!("{:#}", failure.error),
+                }))
+                .collect::<Vec<_>>(),
         }))
     }
 }

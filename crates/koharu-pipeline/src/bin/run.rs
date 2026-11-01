@@ -199,6 +199,9 @@ async fn main() -> Result<()> {
             &mut committer,
         )
         .await?;
+    if let Some(failure) = report.failures.into_iter().next() {
+        return Err(failure.error.into());
+    }
     eprintln!("pipeline finished in {:.2}s", report.elapsed.as_secs_f64());
 
     let renderer = Renderer::new()?;

@@ -10,8 +10,8 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use crate::{
-    Committer, ErrorKind, PipelineError, Progress, ProgressSink, Report, Request, RunStatus, Stage,
-    StageOutput, StopToken,
+    Committer, ErrorKind, PageFailure, PipelineError, Progress, ProgressSink, Report, Request,
+    RunStatus, Stage, StageOutput, StopToken,
     images::ImageCache,
     progress,
     resources::ResourceMonitor,
@@ -33,6 +33,10 @@ pub(crate) struct Execution<'a> {
     images: BTreeMap<EntityId, Arc<ImageCache>>,
     busy_stages: BTreeSet<Stage>,
     completed: usize,
+    /// Work items that ended without completing: failed stages and the
+    /// dependent stages they abandoned.
+    failed: usize,
+    page_failures: Vec<PageFailure>,
     failure: Option<PipelineError>,
     base: koharu_scene::Revision,
     started: Instant,
@@ -85,6 +89,8 @@ impl<'a> Execution<'a> {
             images: BTreeMap::new(),
             busy_stages: BTreeSet::new(),
             completed: 0,
+            failed: 0,
+            page_failures: Vec::new(),
             failure: None,
             base,
             started,
@@ -166,7 +172,17 @@ impl<'a> Execution<'a> {
             elapsed,
             outcome,
         } = completion;
-        match outcome? {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // A processing failure belongs to its page. Model loading, commits,
+            // and invalid requests affect every page and still end the run.
+            Err(error) if error.kind == ErrorKind::Processing => {
+                self.fail_stage(page, stage, error);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        match outcome {
             StageOutcome::Stopped => {}
             StageOutcome::Skipped => {
                 self.mark_complete(page, stage);
@@ -228,6 +244,24 @@ impl<'a> Execution<'a> {
         self.completed += 1;
     }
 
+    fn fail_stage(&mut self, page: EntityId, stage: Stage, error: PipelineError) {
+        tracing::warn!(%page, %stage, error = %format!("{error:#}"), "pipeline stage failed; other pages continue");
+        let (abandoned, page_finished) = self.scheduler.fail_stage(page, stage);
+        if page_finished {
+            self.images.remove(&page);
+        }
+        self.failed += 1 + abandoned.len();
+        self.page_failures.push(PageFailure { page, error });
+        progress::emit(
+            self.progress.as_ref(),
+            Progress::Failed {
+                page,
+                stage,
+                abandoned,
+            },
+        );
+    }
+
     fn stopped(&self) -> bool {
         self.stop.stopped()
     }
@@ -236,13 +270,13 @@ impl<'a> Execution<'a> {
         if let Some(error) = self.failure.take() {
             return Err(error);
         }
-        if !self.stopped() && self.completed != self.scheduler.total() {
+        let ended = self.completed + self.failed;
+        if !self.stopped() && ended != self.scheduler.total() {
             return Err(PipelineError::new(
                 ErrorKind::InvalidOutput,
                 None,
                 anyhow::anyhow!(
-                    "pipeline scheduler stopped after {} of {} work items",
-                    self.completed,
+                    "pipeline scheduler stopped after {ended} of {} work items",
                     self.scheduler.total()
                 ),
             ));
@@ -255,7 +289,7 @@ impl<'a> Execution<'a> {
         Ok(self.report(status))
     }
 
-    fn report(&self, status: RunStatus) -> Report {
+    fn report(&mut self, status: RunStatus) -> Report {
         Report {
             status,
             base: self.base,
@@ -263,6 +297,7 @@ impl<'a> Execution<'a> {
             completed: self.completed,
             total: self.scheduler.total(),
             elapsed: self.started.elapsed(),
+            failures: std::mem::take(&mut self.page_failures),
         }
     }
 }
