@@ -441,6 +441,8 @@ function PageImportMenu({
   )
 }
 
+const HOVER_INTENT_DELAY_MS = 150
+
 function PageItem({
   page,
   active,
@@ -467,6 +469,12 @@ function PageItem({
   onDrop: () => void
 }) {
   const { t } = useTranslation()
+  const hoverIntent = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelHoverIntent = () => {
+    if (hoverIntent.current) clearTimeout(hoverIntent.current)
+    hoverIntent.current = null
+  }
+  useEffect(() => cancelHoverIntent, [])
 
   return (
     <article
@@ -482,10 +490,18 @@ function PageItem({
             : 'hover:bg-foreground/[0.045]',
         dragged && 'opacity-50',
       )}
-      onPointerEnter={onIntent}
+      onPointerEnter={() => {
+        // A prefetch transfers the page's canvas resources, so wait for the
+        // pointer to rest instead of preparing every row it crosses.
+        cancelHoverIntent()
+        if (onIntent) hoverIntent.current = setTimeout(onIntent, HOVER_INTENT_DELAY_MS)
+      }}
+      onPointerLeave={cancelHoverIntent}
       onFocus={onIntent}
       onClick={(event) => {
         if ((event.target as HTMLElement).closest('button,[role="menuitem"]')) return
+        // Selecting the page opens it, so a pending hover prefetch is redundant.
+        cancelHoverIntent()
         onSelect(event.ctrlKey || event.metaKey, event.shiftKey)
       }}
       onDoubleClick={onRename}
