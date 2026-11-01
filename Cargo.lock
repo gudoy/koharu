@@ -4879,7 +4879,9 @@ dependencies = [
  "koharu-rasterizer",
  "koharu-renderer",
  "koharu-scene",
+ "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tokio-rayon",
  "tracing",
 ]
