@@ -105,7 +105,7 @@ pub(crate) async fn build(
     }
     validate_dimensions(width, height)?;
 
-    let source = read_image(snapshot, frame.page(), SOURCE_ROLE).await?;
+    let source = source_image(snapshot, frame).await?;
     if options.include_source && source.is_none() {
         return Err(PsdExportError::MissingAsset {
             page: frame.page(),
@@ -124,7 +124,7 @@ pub(crate) async fn build(
         push_raster_layer(
             &mut layers,
             "Original Image",
-            source.to_rgba8(),
+            source,
             options.include_raster_layers && has_raster_layers,
         )?;
     }
@@ -245,6 +245,15 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), PsdExportError> {
         return Err(PsdExportError::UnsupportedDimensions { width, height });
     }
     Ok(())
+}
+
+async fn source_image(
+    snapshot: &Snapshot,
+    frame: &Frame,
+) -> Result<Option<RgbaImage>, PsdExportError> {
+    Ok(read_image(snapshot, frame.page(), SOURCE_ROLE)
+        .await?
+        .map(|source| source.to_rgba8()))
 }
 
 async fn read_image(
