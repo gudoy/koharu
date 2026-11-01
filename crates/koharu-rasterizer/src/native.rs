@@ -127,7 +127,12 @@ impl Rasterizer {
         })
     }
 
-    pub fn clear_resources(&self) {}
+    /// Releases cached raster tiles and pooled readback targets.
+    pub fn clear_resources(&self) {
+        let mut gpu = self.gpu.lock();
+        gpu.compositor.clear_resources();
+        gpu.targets.clear();
+    }
 
     pub fn rasterize(&self, frame: &Frame, options: RasterOptions) -> Result<Raster> {
         let (width, height) = frame.size();

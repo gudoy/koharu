@@ -240,9 +240,11 @@ impl Renderer {
         .map_err(Error::FontResource)
     }
 
-    /// Discards retained Vello nodes after their presentation resource lifetime ends.
+    /// Discards retained Vello nodes and decoded images after their presentation resource
+    /// lifetime ends.
     pub fn discard_retained_nodes(&self) {
         self.inner.nodes.lock().clear();
+        self.inner.images.lock().clear();
     }
 
     async fn finish(
