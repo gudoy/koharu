@@ -100,10 +100,12 @@ writes to one project.
 
 ## Garbage collection
 
-Collection marks blob IDs referenced by both valid on-disk state slots and all
-live `Blobs` scopes, including mapped readers and scene undo history. It then
-removes unmarked immutable blob files. Collection is explicit and never part of
-the save critical path.
+Collection marks blob IDs referenced by both on-disk state slots, the loaded
+head state, and all live `Blobs` scopes, including mapped readers and scene undo
+history. It then removes unmarked immutable blob files. If a slot file exists
+but cannot be read, collection fails and removes nothing. Opening a project
+collects once, before any state is loaded; collection is never part of the save
+critical path.
 
 ## Performance rules
 
