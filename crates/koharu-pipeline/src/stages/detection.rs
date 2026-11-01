@@ -283,7 +283,7 @@ async fn write_page(
         .context("failed to write detected regions")?;
     link_dialogue_regions(edit, &regions, generation)
         .context("failed to associate detected text with dialogue regions")?;
-    write_masks(input, edit, page, &detections, size)
+    write_masks(input, edit, page, detections, size)
         .await
         .context("failed to write detection masks")
 }
@@ -1358,7 +1358,7 @@ async fn write_masks(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
-    detections: &[KoharuLayoutDetection],
+    detections: Vec<KoharuLayoutDetection>,
     size: ImageSize,
 ) -> Result<()> {
     write_mask(input, edit, page, detections, size).await?;
@@ -1370,16 +1370,13 @@ async fn write_mask(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
-    detections: &[KoharuLayoutDetection],
+    mut detections: Vec<KoharuLayoutDetection>,
     size: ImageSize,
 ) -> Result<()> {
     // Stamping, closing and encoding a page-sized mask is CPU work, so it runs
     // off the async workers. Only text detections feed the mask.
-    let text = detections
-        .iter()
-        .filter(|detection| detection.label == "text")
-        .cloned()
-        .collect::<Vec<_>>();
+    detections.retain(|detection| detection.label == "text");
+    let text = detections;
     let mut mask = tokio_rayon::spawn(move || {
         if size.width > 0 && size.height > 0 {
             let radius = ((size.width.max(size.height) as f32 / 1024.0) * 6.0)
