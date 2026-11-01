@@ -31,12 +31,14 @@ import {
   projectKey,
   queryClient,
   useCommand,
+  usePage,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
 import * as canvasRuntime from '@koharu/bridge/canvas'
 import {
   commands,
   type Layer,
+  type Page,
   type PageSummary,
   type Preferences,
   type ProjectInfo,
@@ -477,6 +479,35 @@ describe('greenfield editor', () => {
       'blob:koharu-thumbnail',
     )
     expect(screen.queryByText('01')).not.toBeInTheDocument()
+  })
+
+  it('does not re-render the page rail when the open page is edited', async () => {
+    installProject()
+    vi.spyOn(commands, 'getThumbnail').mockResolvedValue([1])
+    const railRender = vi.fn()
+    function OpenPageLayers() {
+      return <output aria-label='Open page layers'>{usePage().data?.layers.length}</output>
+    }
+    render(
+      <>
+        <Profiler id='rail' onRender={railRender}>
+          <PageRail />
+        </Profiler>
+        <OpenPageLayers />
+      </>,
+    )
+    await screen.findByRole('img', { name: 'Page 1' })
+    railRender.mockClear()
+
+    const page = queryClient.getQueryData<Page>(pageKey)!
+    act(() => {
+      queryClient.setQueryData(pageKey, { ...page, layers: [textLayer, secondLayer] })
+    })
+
+    await waitFor(() =>
+      expect(screen.getByRole('status', { name: 'Open page layers' })).toHaveTextContent('2'),
+    )
+    expect(railRender).not.toHaveBeenCalled()
   })
 
   it('keeps rapid page switches on the latest native selection', async () => {

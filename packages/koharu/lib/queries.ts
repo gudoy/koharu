@@ -9,7 +9,7 @@ import {
   useQuery,
 } from '@tanstack/react-query'
 
-import { commands, type FontFamily } from '@koharu/bridge/protocol'
+import { commands, type FontFamily, type Page, type ProjectInfo } from '@koharu/bridge/protocol'
 
 import { call } from './backend'
 
@@ -54,12 +54,22 @@ export function useProject(enabled = true) {
   return useQuery({ ...projectQuery, enabled })
 }
 
+/** Subscribes to a projection of the project, so a commit that leaves it equal does not re-render. */
+export function useProjectSelect<T>(select: (project: ProjectInfo | null) => T) {
+  return useQuery({ ...projectQuery, select }).data
+}
+
 export function usePages(enabled = true) {
   return useQuery({ ...pagesQuery, enabled })
 }
 
 export function usePage(enabled = true) {
   return useQuery({ ...pageQuery, enabled })
+}
+
+/** Subscribes to a projection of the open page, so an edit that leaves it equal does not re-render. */
+export function usePageSelect<T>(select: (page: Page | null) => T) {
+  return useQuery({ ...pageQuery, select }).data
 }
 
 export function useFonts(enabled = true) {

@@ -24,7 +24,7 @@ import {
   queryClient,
   refresh,
   useImportPages,
-  usePage,
+  usePageSelect,
   usePages,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
@@ -59,6 +59,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@koharu/ui/components/t
 import { cn } from '@koharu/ui/lib/utils'
 
 const emptyPages: PageSummary[] = []
+const selectPageId = (page: Page | null) => page?.id ?? null
 
 interface IntentPrefetchState {
   project: string
@@ -69,7 +70,7 @@ interface IntentPrefetchState {
 export function PageRail() {
   const { t } = useTranslation()
   const pages = usePages().data ?? emptyPages
-  const active = usePage().data?.id ?? null
+  const active = usePageSelect(selectPageId) ?? null
   const selected = useKoharuStore((state) => state.selectedPages)
   const selectPages = useKoharuStore((state) => state.selectPages)
   const selectLayers = useKoharuStore((state) => state.selectLayers)
