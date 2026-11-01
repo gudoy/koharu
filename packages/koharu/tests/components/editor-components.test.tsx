@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { TitleBar } from '@/components/app/TitleBar'
 import { WindowControls } from '@/components/app/WindowChrome'
+import { ModelPicker } from '@/components/controls/ModelPicker'
 import { ActivityCenter } from '@/components/editor/ActivityCenter'
 import { CanvasCommandBar } from '@/components/editor/CanvasCommandBar'
 import { Inspector } from '@/components/editor/Inspector'
@@ -1284,6 +1285,43 @@ describe('greenfield editor', () => {
     expect(useKoharuStore.getState().preferences?.pipeline.translation).toEqual(
       nextPreferences.pipeline.translation,
     )
+  })
+
+  it('mounts only the visible rows of a large model catalogue', () => {
+    const models = Array.from({ length: 500 }, (_, index) => ({
+      provider: 'openrouter' as const,
+      model: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      quantizations:
+        index === 499
+          ? [
+              { id: 'q4', name: 'Q4_K_M', downloaded: false },
+              { id: 'q8', name: 'Q8_0', downloaded: true },
+            ]
+          : [],
+      vision: false,
+      reasoning: false,
+    }))
+    render(
+      <ModelPicker
+        value={null}
+        models={models}
+        providers={preferences.providers.entries}
+        onBack={() => undefined}
+        onSelect={() => undefined}
+      />,
+    )
+
+    expect(
+      screen.getAllByRole('button', { name: /^Use Model \d+ from/ }).length,
+    ).toBeLessThanOrEqual(40)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 499' },
+    })
+    expect(screen.getAllByRole('button', { name: /^Use Model \d+ from/ })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 499 from/ }))
+    expect(screen.getByRole('button', { name: 'Q4_K_M' })).toHaveFocus()
   })
 
   it('constrains long model names inside the runtime selector', async () => {
