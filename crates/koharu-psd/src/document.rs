@@ -88,13 +88,21 @@ pub(crate) struct TextMetadata {
 pub(crate) async fn build(
     snapshot: &Snapshot,
     frame: &Frame,
+    merged: RgbaImage,
     rasterizer: Arc<Rasterizer>,
     raster_options: RasterOptions,
     options: &PsdExportOptions,
 ) -> Result<Document, PsdExportError> {
-    let merged = rasterize(Arc::clone(&rasterizer), frame, raster_options).await?;
-    let width = merged.image.width();
-    let height = merged.image.height();
+    let (width, height) = merged.dimensions();
+    if (width, height) != frame.size() {
+        let (expected_width, expected_height) = frame.size();
+        return Err(PsdExportError::MismatchedComposite {
+            width,
+            height,
+            expected_width,
+            expected_height,
+        });
+    }
     validate_dimensions(width, height)?;
 
     let source = read_image(snapshot, frame.page(), SOURCE_ROLE).await?;
@@ -216,7 +224,7 @@ pub(crate) async fn build(
     Ok(Document {
         width,
         height,
-        merged: merged.image,
+        merged,
         layers,
     })
 }

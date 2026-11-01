@@ -23,7 +23,7 @@ use koharu_desktop::Desktop;
 /// Written beside the exported folders. It records each folder's outcome so a
 /// rerun resumes after the last completed one and failures can be inspected.
 const REPORT_FILE: &str = "koharu-batch.json";
-const FORMATS: [ExportFormat; 2] = [ExportFormat::Psd, ExportFormat::Png];
+pub(crate) const FORMATS: [ExportFormat; 2] = [ExportFormat::Psd, ExportFormat::Png];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,9 +236,7 @@ async fn translate(
     let pages = snapshot.pages().count();
     fs::create_dir_all(output).with_context(|| format!("failed to create {}", output.display()))?;
     let desktop = handle.state::<Desktop>();
-    for format in FORMATS {
-        output::write(&desktop, snapshot.clone(), format, output.to_owned()).await?;
-    }
+    output::write(&desktop, snapshot, &FORMATS, output.to_owned()).await?;
     Ok(Outcome::Done(pages))
 }
 
