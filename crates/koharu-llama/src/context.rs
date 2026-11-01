@@ -93,6 +93,11 @@ impl LlamaContext {
         unsafe { koharu_llama_sys::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Sets whether attention is causal, overriding the attention type the context was created with.
+    pub fn set_causal_attn(&mut self, causal: bool) {
+        unsafe { koharu_llama_sys::llama_set_causal_attn(self.context.as_ptr(), causal) }
+    }
+
     /// Decodes the batch.
     ///
     /// # Errors
