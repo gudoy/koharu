@@ -470,6 +470,7 @@ mod tests {
         let unread = add_page(&mut edit, true);
         let blank = add_page(&mut edit, true);
         let edited = add_page(&mut edit, true);
+        let stale = add_page(&mut edit, true);
         let not_cleaned = add_page(&mut edit, false);
         let no_text = add_page(&mut edit, true);
         let done_text = add_text(&mut edit, done);
@@ -478,10 +479,13 @@ mod tests {
         add_text(&mut edit, unread);
         let blank_text = add_text(&mut edit, blank);
         let edited_text = add_text(&mut edit, edited);
+        let stale_text = add_text(&mut edit, stale);
         let not_cleaned_text = add_text(&mut edit, not_cleaned);
         // Neither OCR nor translation rewrites user-authored text.
         edit.set(edited_text, &source("こんにちは")).unwrap();
         edit.set(edited_text, &translation("Hi", None)).unwrap();
+        // A generated translation may predate the user's edit of its source.
+        edit.set(stale_text, &source("こんばんは")).unwrap();
         session.commit(edit.finish().unwrap()).await.unwrap();
 
         let mut edit = session.snapshot().edit_as(Generation::new(
@@ -497,7 +501,7 @@ mod tests {
         }
         // Translation skips blank sources, so none is expected.
         edit.set(blank_text, &source("  ")).unwrap();
-        for content in [done_text, not_cleaned_text] {
+        for content in [done_text, stale_text, not_cleaned_text] {
             edit.set(content, &translation("Hello", Some("en")))
                 .unwrap();
         }
@@ -507,7 +511,14 @@ mod tests {
 
         assert_eq!(
             pending_pages(&session.snapshot(), &LanguageTag::new("en").unwrap()).unwrap(),
-            [untranslated, other_language, unread, not_cleaned, no_text]
+            [
+                untranslated,
+                other_language,
+                unread,
+                stale,
+                not_cleaned,
+                no_text
+            ]
         );
     }
 }
