@@ -660,7 +660,7 @@ describe('greenfield editor', () => {
       },
     ])
     const prefetch = vi.spyOn(canvasRuntime, 'prefetchCanvasPages').mockResolvedValue([])
-    vi.spyOn(commands, 'selectPage').mockResolvedValue(null)
+    vi.spyOn(commands, 'selectPage')
     render(<PageRail />)
     const item = screen.getByText('Page 2').closest('article')!
 
