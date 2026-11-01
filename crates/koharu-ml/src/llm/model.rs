@@ -9,16 +9,13 @@ use std::{
     fmt::{Debug, Formatter},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use koharu_llama::{
-    context::{
-        LlamaContext,
-        params::{LlamaAttentionType, LlamaContextParams},
-    },
+    context::{LlamaContext, params::LlamaContextParams},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaModel, params::LlamaModelParams},
@@ -36,12 +33,18 @@ use super::{
 use crate::Backend;
 
 const DEFAULT_MAX_UBATCH: u32 = 512;
+/// A new context rounds n_ctx and n_batch up to these steps, so a model settles on a few
+/// contexts instead of one per prompt length.
+const CONTEXT_STEP: u32 = 1024;
+const BATCH_STEP: u32 = 512;
 const CHAT_TEMPLATE_NAME: &str = "chat";
 
 pub(super) struct Model {
     backend: &'static LlamaBackend,
-    model: LlamaModel,
+    model: Arc<LlamaModel>,
     mtmd: Option<Mutex<MtmdContext>>,
+    /// One llama.cpp context reused across requests and replaced only when outgrown.
+    context: ContextSlot<LlamaContext>,
     capabilities: Capabilities,
     eos_token: LlamaToken,
     chat_template: ChatTemplate,
@@ -136,8 +139,10 @@ impl Model {
         ensure_file(&model_path, "GGUF model")?;
         let backend = crate::llama_backend().context("llama.cpp backend is not initialized")?;
         let params = model_params(backend, device, &options)?;
-        let model = LlamaModel::load_from_file(backend, &model_path, &params)
-            .with_context(|| format!("failed to load GGUF model {}", model_path.display()))?;
+        let model = Arc::new(
+            LlamaModel::load_from_file(backend, &model_path, &params)
+                .with_context(|| format!("failed to load GGUF model {}", model_path.display()))?,
+        );
         ensure!(
             model.has_decoder(),
             "GGUF model does not advertise a decoder graph"
@@ -196,6 +201,7 @@ impl Model {
             backend,
             model,
             mtmd,
+            context: ContextSlot(Mutex::default()),
             capabilities,
             eos_token,
             chat_template,
@@ -250,11 +256,22 @@ impl Model {
             )
         };
         let prepared = self.prepare_prompt(input, options.add_special, mtmd.as_deref())?;
-        let context_config = context_config(&prepared, options)?;
-        let mut context = self
-            .model
-            .new_context(self.backend, context_config.params)
-            .context("failed to create llama.cpp context")?;
+        let request = ContextKey {
+            values: context_values(&prepared, options)?,
+            n_threads: options.n_threads,
+            n_threads_batch: options.n_threads_batch,
+        };
+        let (context_key, mut context) =
+            self.context.take(request, prepared.non_causal, |key| {
+                self.model
+                    .new_context(self.backend, context_params(key))
+                    .context("failed to create llama.cpp context")
+            })?;
+        // Start from the state of a context created for this prompt: an empty KV cache, and
+        // non-causal attention for a non-causal prompt until the MTMD helper restores causal
+        // attention after its image chunks.
+        context.clear_kv_cache();
+        context.set_causal_attn(!prepared.non_causal);
         let mut sampler = self.build_sampler(options, json_schema, &prepared.history_tokens)?;
 
         let prompt_start = Instant::now();
@@ -263,7 +280,7 @@ impl Model {
             mtmd.as_deref(),
             &mut context,
             &mut sampler,
-            context_config.n_batch,
+            request.values.n_batch,
         )?;
         let prompt_duration = prompt_start.elapsed();
         drop(mtmd);
@@ -316,6 +333,7 @@ impl Model {
             // llama_sampler_sample applies the chain and accepts the selected token.
             next_token = sampler.sample(&context, -1);
         }
+        self.context.put(context_key, context);
 
         Ok(Generation {
             text,
@@ -423,7 +441,7 @@ impl Model {
         &self,
         prepared: &PreparedPrompt,
         mtmd: Option<&MtmdContext>,
-        context: &mut LlamaContext<'_>,
+        context: &mut LlamaContext,
         sampler: &mut LlamaSampler,
         n_batch: u32,
     ) -> Result<(LlamaToken, i32)> {
@@ -469,7 +487,7 @@ impl Model {
 
     fn start_decoder(
         &self,
-        context: &mut LlamaContext<'_>,
+        context: &mut LlamaContext,
         sampler: &mut LlamaSampler,
     ) -> Result<(LlamaToken, i32)> {
         let decoder_start = self.model.decode_start_token();
@@ -592,11 +610,6 @@ enum PreparedPromptKind {
     },
 }
 
-struct ContextConfig {
-    params: LlamaContextParams,
-    n_batch: u32,
-}
-
 fn model_params(
     backend: &LlamaBackend,
     device: &crate::Device,
@@ -618,27 +631,111 @@ fn model_params(
     Ok(params)
 }
 
-fn context_config(prepared: &PreparedPrompt, options: &GenerationOptions) -> Result<ContextConfig> {
-    let values = context_values(prepared, options)?;
-    let mut params = LlamaContextParams::default()
-        .with_n_ctx(Some(values.n_ctx))
-        .with_n_batch(values.n_batch)
-        .with_n_ubatch(values.n_ubatch);
-    if prepared.non_causal {
-        params = params.with_attention_type(LlamaAttentionType::NonCausal);
+/// The llama.cpp context a model keeps between requests. A request takes it and puts it back
+/// only on success, so a failed request leaves no context behind and concurrent requests never
+/// share one.
+struct ContextSlot<C>(Mutex<Option<(ContextKey, C)>>);
+
+impl<C> ContextSlot<C> {
+    /// Takes the stored context if it serves `request`. Otherwise drops it before creating the
+    /// replacement, so its buffers are freed first.
+    fn take(
+        &self,
+        request: ContextKey,
+        non_causal: bool,
+        create: impl FnOnce(&ContextKey) -> Result<C>,
+    ) -> Result<(ContextKey, C)> {
+        let stored = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some((key, context)) = stored {
+            if key.serves(&request) {
+                return Ok((key, context));
+            }
+            drop(context);
+        }
+        let key = request.capacity(non_causal);
+        Ok((key, create(&key)?))
     }
-    if let Some(n_threads) = options.n_threads {
-        params = params.with_n_threads(n_threads);
+
+    /// Stores the context of a successful request for the next one.
+    fn put(&self, key: ContextKey, context: C) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, context));
     }
-    if let Some(n_threads_batch) = options.n_threads_batch {
-        params = params.with_n_threads_batch(n_threads_batch);
-    }
-    Ok(ContextConfig {
-        params,
-        n_batch: values.n_batch,
-    })
 }
 
+/// What a request needs from a llama.cpp context, or what a stored context provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContextKey {
+    values: ContextValues,
+    n_threads: Option<i32>,
+    n_threads_batch: Option<i32>,
+}
+
+impl ContextKey {
+    /// Whether this context decodes `request` as a context sized for it would: large enough,
+    /// with the same threads, and splitting each decode into the same micro-batches.
+    fn serves(&self, request: &Self) -> bool {
+        let (have, need) = (self.values, request.values);
+        self.n_threads == request.n_threads
+            && self.n_threads_batch == request.n_threads_batch
+            && have.n_ctx >= need.n_ctx
+            && have.n_batch >= need.n_batch
+            && if need.n_ubatch < need.n_batch {
+                have.n_ubatch == need.n_ubatch
+            } else {
+                // Each decode fits one micro-batch. llama.cpp aborts when a non-causal one does not.
+                have.n_ubatch >= need.n_batch
+            }
+    }
+
+    /// The size of a new context for this request, rounded up. n_ubatch keeps the request's
+    /// micro-batch split: its own value when it splits decodes, otherwise one micro-batch for any
+    /// batch the context accepts (non-causal) or up to `DEFAULT_MAX_UBATCH` tokens (causal).
+    fn capacity(self, non_causal: bool) -> Self {
+        let values = self.values;
+        let n_ctx = NonZeroU32::new(round_up(values.n_ctx.get(), CONTEXT_STEP))
+            .expect("rounded context size is non-zero");
+        let n_batch = round_up(values.n_batch, BATCH_STEP);
+        let n_ubatch = if values.n_ubatch < values.n_batch {
+            values.n_ubatch
+        } else if non_causal {
+            n_batch
+        } else {
+            n_batch.min(DEFAULT_MAX_UBATCH).max(values.n_ubatch)
+        };
+        Self {
+            values: ContextValues {
+                n_ctx,
+                n_batch,
+                n_ubatch,
+            },
+            ..self
+        }
+    }
+}
+
+fn round_up(value: u32, step: u32) -> u32 {
+    value.checked_next_multiple_of(step).unwrap_or(value)
+}
+
+fn context_params(key: &ContextKey) -> LlamaContextParams {
+    // Every decode outputs at most one token: the last prompt token or the generated one. By
+    // default llama.cpp reserves n_vocab logits for each micro-batch token in the compute buffer
+    // (1 MiB per token for a 262k vocabulary). Encoder models ignore this limit.
+    let mut params = LlamaContextParams::default()
+        .with_n_ctx(Some(key.values.n_ctx))
+        .with_n_batch(key.values.n_batch)
+        .with_n_ubatch(key.values.n_ubatch)
+        .with_n_outputs_max(1);
+    if let Some(n_threads) = key.n_threads {
+        params = params.with_n_threads(n_threads);
+    }
+    if let Some(n_threads_batch) = key.n_threads_batch {
+        params = params.with_n_threads_batch(n_threads_batch);
+    }
+    params
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ContextValues {
     n_ctx: NonZeroU32,
     n_batch: u32,
@@ -795,6 +892,8 @@ fn available_threads() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
 
     #[test]
@@ -884,5 +983,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.n_ubatch, 1024);
+    }
+
+    fn key(n_ctx: u32, n_batch: u32, n_ubatch: u32) -> ContextKey {
+        ContextKey {
+            values: ContextValues {
+                n_ctx: NonZeroU32::new(n_ctx).unwrap(),
+                n_batch,
+                n_ubatch,
+            },
+            n_threads: None,
+            n_threads_batch: None,
+        }
+    }
+
+    struct FakeContext {
+        id: usize,
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Drop for FakeContext {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push(format!("drop {}", self.id));
+        }
+    }
+
+    /// Runs one successful request and returns the id of the context it used.
+    fn run_request(
+        slot: &ContextSlot<FakeContext>,
+        events: &Rc<RefCell<Vec<String>>>,
+        request: ContextKey,
+        non_causal: bool,
+    ) -> usize {
+        let (key, context) = slot
+            .take(request, non_causal, |_| {
+                let id = events
+                    .borrow()
+                    .iter()
+                    .filter(|event| event.starts_with("create"))
+                    .count()
+                    + 1;
+                events.borrow_mut().push(format!("create {id}"));
+                Ok(FakeContext {
+                    id,
+                    events: Rc::clone(events),
+                })
+            })
+            .unwrap();
+        let id = context.id;
+        slot.put(key, context);
+        id
+    }
+
+    #[test]
+    fn context_slot_reuses_until_outgrown() {
+        let slot = ContextSlot(Mutex::default());
+        let events = Rc::default();
+
+        assert_eq!(run_request(&slot, &events, key(700, 600, 512), false), 1);
+        assert_eq!(run_request(&slot, &events, key(300, 200, 200), false), 1);
+        assert_eq!(run_request(&slot, &events, key(2100, 600, 512), false), 2);
+        // The outgrown context is freed before its replacement is allocated.
+        assert_eq!(*events.borrow(), ["create 1", "drop 1", "create 2"]);
+    }
+
+    #[test]
+    fn context_slot_keeps_micro_batch_split() {
+        let slot = ContextSlot(Mutex::default());
+        let events = Rc::default();
+
+        assert_eq!(run_request(&slot, &events, key(1813, 700, 512), false), 1);
+        // llama.cpp aborts when a non-causal batch does not fit one micro-batch.
+        assert_eq!(run_request(&slot, &events, key(1813, 700, 700), true), 2);
+        // A causal prompt split at 512 tokens must not run as one micro-batch.
+        assert_eq!(run_request(&slot, &events, key(1813, 700, 512), false), 3);
+        assert_eq!(run_request(&slot, &events, key(900, 300, 300), false), 3);
+    }
+
+    #[test]
+    fn context_capacity_rounds_without_changing_micro_batches() {
+        assert_eq!(key(1813, 700, 512).capacity(false), key(2048, 1024, 512));
+        assert_eq!(key(1813, 700, 700).capacity(true), key(2048, 1024, 1024));
+        assert_eq!(key(300, 300, 300).capacity(false), key(1024, 512, 512));
+        assert_eq!(key(300, 300, 32).capacity(false), key(1024, 512, 32));
     }
 }
