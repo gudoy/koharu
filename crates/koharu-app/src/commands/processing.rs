@@ -170,7 +170,6 @@ pub(crate) async fn start(
                     stage,
                     abandoned,
                 } => {
-                    let mut progress = progress.lock();
                     progress.0 = progress
                         .0
                         .saturating_add(1 + abandoned.len())
