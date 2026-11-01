@@ -39,7 +39,12 @@ import {
   useKoharuStore,
   type CanvasTool,
 } from '@/lib/store'
-import { prefetchCanvasPages, workspaceColor, type CanvasColor } from '@koharu/bridge/canvas'
+import {
+  prefetchCanvasPages,
+  workspaceColor,
+  type Canvas,
+  type CanvasColor,
+} from '@koharu/bridge/canvas'
 import { commands, type Frame, type Point, type TransformFrame } from '@koharu/bridge/protocol'
 import { Button } from '@koharu/ui/components/button'
 
@@ -111,6 +116,13 @@ export function CanvasWorkspace() {
   const [canvasElement, setCanvasElement] = useState<HTMLCanvasElement | null>(null)
   const gesture = useRef<Gesture | null>(null)
   const previousPageIndex = useRef<number | null>(null)
+  const neighbourPrefetch = useRef<{
+    canvas: Canvas | null
+    page: string
+    direction: number
+    neighbour: string | null
+    revision: number | null
+  } | null>(null)
   const spaceHeld = useRef(false)
   const transformActive = useRef(false)
   const transformRevision = useRef<number | null>(null)
@@ -334,20 +346,48 @@ export function CanvasWorkspace() {
       return
     const index = pages.findIndex((candidate) => candidate.id === pageId)
     if (index < 0) return
+    const last = neighbourPrefetch.current
     const previous = previousPageIndex.current
     previousPageIndex.current = index
-    const direction = previous !== null && index < previous ? -1 : 1
-    const adjacent = pages[index + direction]?.id ?? pages[index - direction]?.id
-    if (adjacent) {
-      void prefetchCanvasPages([adjacent])
-        .then((prepared) => {
-          for (const page of prepared) {
-            queryClient.setQueryData(preparedPageKey(page.page.id), page)
-          }
-        })
-        .catch(() => undefined)
+    // The direction is set when the page changes; a re-run on the same page keeps it.
+    const direction =
+      last?.page === pageId ? last.direction : previous !== null && index < previous ? -1 : 1
+    const neighbour = pages[index + direction]?.id ?? pages[index - direction]?.id ?? null
+    // An instant switch needs the neighbour's frame at the current revision in the current
+    // canvas. Prepare it again when one of those changes, not on a re-run that changes none.
+    if (
+      last?.page === pageId &&
+      last.canvas === canvas &&
+      last.neighbour === neighbour &&
+      last.revision === canvasRevision
+    )
+      return
+    const visit = { canvas, page: pageId, direction, neighbour, revision: canvasRevision }
+    neighbourPrefetch.current = visit
+    if (!neighbour) return
+    // A superseded or failed prefetch prepared nothing, so the next run tries again.
+    const forget = () => {
+      if (neighbourPrefetch.current === visit)
+        neighbourPrefetch.current = { ...visit, neighbour: null }
     }
-  }, [canvasGeneration, canvasPage, canvasState.generation, canvasState.status, pageId, pages])
+    void prefetchCanvasPages([neighbour])
+      .then((prepared) => {
+        for (const page of prepared) {
+          queryClient.setQueryData(preparedPageKey(page.page.id), page)
+        }
+        if (!prepared.length) forget()
+      })
+      .catch(forget)
+  }, [
+    canvas,
+    canvasGeneration,
+    canvasPage,
+    canvasRevision,
+    canvasState.generation,
+    canvasState.status,
+    pageId,
+    pages,
+  ])
 
   useEffect(() => {
     fitCanvas()

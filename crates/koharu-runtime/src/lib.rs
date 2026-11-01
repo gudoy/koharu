@@ -15,9 +15,11 @@ pub use store::Store;
 
 /// Builds the shared client used by remote APIs and long-running model requests.
 ///
-/// Connection setup follows the shared HTTP policy. Response reads have no
-/// implicit timeout or retry, so callers retain cancellation ownership and
-/// non-idempotent generation requests are never replayed automatically.
+/// Connection setup and response reads follow the shared HTTP policy: a read
+/// that stalls for longer than the configured read timeout fails. There is no
+/// total request deadline and no retry, so callers retain cancellation
+/// ownership of long generations and non-idempotent generation requests are
+/// never replayed automatically.
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
     network::http()
 }

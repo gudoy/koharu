@@ -58,7 +58,7 @@ pub struct KoharuLayoutRFDetrSeg2XLConfig {
 }
 
 pub(super) struct Processor {
-    config: DetectionModel,
+    pub(super) config: DetectionModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }
@@ -283,7 +283,7 @@ async fn write_page(
         .context("failed to write detected regions")?;
     link_dialogue_regions(edit, &regions, generation)
         .context("failed to associate detected text with dialogue regions")?;
-    write_masks(input, edit, page, &detections, size)
+    write_masks(input, edit, page, detections, size)
         .await
         .context("failed to write detection masks")
 }
@@ -1358,7 +1358,7 @@ async fn write_masks(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
-    detections: &[KoharuLayoutDetection],
+    detections: Vec<KoharuLayoutDetection>,
     size: ImageSize,
 ) -> Result<()> {
     write_mask(input, edit, page, detections, size).await?;
@@ -1370,28 +1370,39 @@ async fn write_mask(
     input: &StageInput,
     edit: &mut koharu_scene::Edit,
     page: EntityId,
-    detections: &[KoharuLayoutDetection],
+    mut detections: Vec<KoharuLayoutDetection>,
     size: ImageSize,
 ) -> Result<()> {
-    let mut mask = if size.width > 0 && size.height > 0 {
-        let radius = ((size.width.max(size.height) as f32 / 1024.0) * 6.0)
-            .round()
-            .clamp(1.0, 255.0) as u8;
-        closed_mask_for(detections, "text", size, radius)
-    } else {
-        mask_for(detections, "text", size)
-    };
+    // Stamping, closing and encoding a page-sized mask is CPU work, so it runs
+    // off the async workers. Only text detections feed the mask.
+    detections.retain(|detection| detection.label == "text");
+    let text = detections;
+    let mut mask = tokio_rayon::spawn(move || {
+        if size.width > 0 && size.height > 0 {
+            let radius = ((size.width.max(size.height) as f32 / 1024.0) * 6.0)
+                .round()
+                .clamp(1.0, 255.0) as u8;
+            closed_mask_for(&text, "text", size, radius)
+        } else {
+            mask_for(&text, "text", size)
+        }
+    })
+    .await;
     if let Some(bounds) = input.region {
         preserve_mask_outside_region(input, page, "text-mask", bounds, &mut mask).await?;
     }
-    let mut bytes = Cursor::new(Vec::new());
-    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter)
-        .write_image(
-            mask.as_raw(),
-            mask.width(),
-            mask.height(),
-            ExtendedColorType::L8,
-        )?;
+    let bytes = tokio_rayon::spawn(move || -> Result<_> {
+        let mut bytes = Cursor::new(Vec::new());
+        PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter)
+            .write_image(
+                mask.as_raw(),
+                mask.width(),
+                mask.height(),
+                ExtendedColorType::L8,
+            )?;
+        Ok(bytes)
+    })
+    .await?;
     edit.set_asset(
         page,
         &AssetRole::new("text-mask")?,
@@ -1895,6 +1906,7 @@ mod tests {
             None,
             std::sync::Arc::new(crate::ImageCache::default()),
             None,
+            crate::StopToken::default(),
         );
         let processor = Processor::new(
             DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig::default()),

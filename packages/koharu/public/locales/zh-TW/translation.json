@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "關於",
+    "batch": "批次翻譯資料夾…",
     "closeProject": "關閉專案",
     "delete": "刪除所選項目",
     "discord": "Discord",

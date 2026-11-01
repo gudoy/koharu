@@ -62,9 +62,15 @@ impl StageProcessor for Processor {
         {
             request = request.with_image(image);
         }
+        let stop = input.stop.clone();
         let (provider, translated) = self
             .translator
-            .translate(&self.config.model, self.config.generation, request)
+            .translate(
+                &self.config.model,
+                self.config.generation,
+                request,
+                move || stop.stopped(),
+            )
             .await?;
         let language = LanguageTag::new(self.config.target_language.tag())?;
         let generated = generation(PRODUCER, provider)?;

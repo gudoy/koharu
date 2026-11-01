@@ -118,7 +118,9 @@ impl Desktop {
     }
 
     pub async fn prepare_page(&self, snapshot: &Snapshot, page: EntityId) -> Result<bool> {
-        let request = self.request_preparation();
+        // A prefetch joins the current request instead of issuing one: presentation preempts
+        // it, but it never preempts presentation.
+        let request = self.presentation.read().requested_preparation;
         let _preparation = self.preparation.lock().await;
         if !self.is_current_preparation(request) {
             return Ok(false);
@@ -349,6 +351,21 @@ impl Desktop {
             return Ok(false);
         };
         let rendered = rendered?;
+        if previous
+            .as_ref()
+            .is_some_and(|previous| rendered.same_content(previous))
+        {
+            // Only the revision moved. Keep the generation so the webview does not prepare the
+            // same content again, but store the frame so the next update stays contiguous.
+            let mut presentation = self.presentation.write();
+            if presentation.requested_preparation != request {
+                return Ok(false);
+            }
+            presentation.frame = Some(rendered.clone());
+            drop(presentation);
+            self.page_frames.lock().insert(rendered);
+            return Ok(true);
+        }
         if !self.replace_frame_if_current(request, Some(rendered)) {
             return Ok(false);
         }
@@ -373,6 +390,9 @@ impl Desktop {
         }
         if self.replace_frame_if_current(request, None) {
             self.renderer.discard_retained_nodes();
+            if let Some(rasterizer) = self.rasterizer.get() {
+                rasterizer.clear_resources();
+            }
         }
     }
 
@@ -476,15 +496,10 @@ impl PageFrameCache {
 
     fn insert(&mut self, frame: RenderedFrame) {
         self.clock = self.clock.wrapping_add(1);
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.page == frame.page() && entry.revision == frame.revision())
-        {
-            entry.frame = frame;
-            entry.last_used = self.clock;
-            return;
-        }
+        // Lookups use the project-wide revision, so an older frame of the same page is
+        // unreachable and would only pin its pixel buffers.
+        self.entries
+            .retain(|entry| entry.page != frame.page() || entry.revision > frame.revision());
         self.entries.push(CachedPageFrame {
             page: frame.page(),
             revision: frame.revision(),
@@ -544,6 +559,7 @@ fn transform_point([a, b, c, d, e, f]: [f64; 6], point: &Point) -> Point {
 mod tests {
     use std::{future::pending, sync::Arc, time::Duration};
 
+    use koharu_scene::{At, Group, Origin, PageDraft, Session, Snapshot, Visibility};
     use tokio::{sync::Notify, time::timeout};
 
     use super::Desktop;
@@ -580,6 +596,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_prefetch_waits_for_the_presentation_instead_of_preempting_it() {
+        let mut session = koharu_scene::Session::memory().await.unwrap();
+        let mut page = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let draft = koharu_scene::PageDraft::new("page", 10.0, 10.0);
+                page = Some(edit.add_page(draft, koharu_scene::At::End)?);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let desktop = Arc::new(Desktop::new().unwrap());
+        let presentation_request = desktop.request_preparation();
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let started = Arc::new(Notify::new());
+        let presentation = {
+            let desktop = Arc::clone(&desktop);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                let _preparation = desktop.preparation.lock().await;
+                started.notify_one();
+                desktop
+                    .await_preparation(presentation_request, finished)
+                    .await
+            })
+        };
+        started.notified().await;
+
+        let prefetch = desktop.prepare_page(&snapshot, page);
+        tokio::pin!(prefetch);
+        tokio::select! {
+            biased;
+            _ = &mut prefetch => panic!("the prefetch must wait for the presentation's lock"),
+            () = std::future::ready(()) => {}
+        }
+        finish.send(()).unwrap();
+
+        assert!(
+            presentation.await.unwrap().is_some(),
+            "a page prefetch superseded the presentation"
+        );
+        assert!(prefetch.await.unwrap());
+    }
+
+    #[tokio::test]
     async fn obsolete_request_cannot_replace_the_presentation() {
         let desktop = Desktop::new().unwrap();
         let obsolete = desktop.request_preparation();
@@ -589,5 +652,115 @@ mod tests {
         assert_eq!(desktop.canvas_state().generation, 0);
         assert!(desktop.replace_frame_if_current(latest, None));
         assert_eq!(desktop.canvas_state().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn page_frame_cache_keeps_only_the_newest_frame_of_each_page() {
+        let mut session = Session::memory().await.unwrap();
+        let mut pages = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let first = edit.add_page(PageDraft::new("first", 10.0, 10.0), At::End)?;
+                let second = edit.add_page(PageDraft::new("second", 10.0, 10.0), At::End)?;
+                pages = Some((first, second));
+                Ok(())
+            })
+            .unwrap();
+        let mut snapshot = session.commit(create).await.unwrap().snapshot;
+        let (first, second) = pages.unwrap();
+        let desktop = Desktop::new().unwrap();
+        assert!(desktop.show_page(&snapshot, Some(first)).await.unwrap());
+        assert!(desktop.prepare_page(&snapshot, second).await.unwrap());
+
+        for opacity in [0.9, 0.8, 0.7, 0.6] {
+            let patch = snapshot
+                .patch(|edit| {
+                    edit.set(
+                        first,
+                        &Visibility {
+                            origin: Origin::User,
+                            visible: true,
+                            opacity,
+                        },
+                    )
+                })
+                .unwrap();
+            let commit = session.commit(patch).await.unwrap();
+            assert!(
+                desktop
+                    .synchronize(&commit.snapshot, Some(first), &commit)
+                    .await
+                    .unwrap()
+            );
+            snapshot = commit.snapshot;
+        }
+
+        let cached = desktop
+            .page_frames
+            .lock()
+            .entries
+            .iter()
+            .map(|entry| (entry.page, entry.revision))
+            .collect::<Vec<_>>();
+        assert_eq!(cached.iter().filter(|(page, _)| *page == first).count(), 1);
+        assert!(cached.contains(&(first, snapshot.revision())));
+        assert!(cached.iter().any(|(page, _)| *page == second));
+    }
+
+    #[tokio::test]
+    async fn commit_on_another_page_keeps_the_canvas_generation() {
+        let mut session = Session::memory().await.unwrap();
+        let mut pages = None;
+        let create = session
+            .snapshot()
+            .patch(|edit| {
+                let shown = edit.add_page(PageDraft::new("shown", 10.0, 10.0), At::End)?;
+                let other = edit.add_page(PageDraft::new("other", 10.0, 10.0), At::End)?;
+                pages = Some((shown, other));
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(create).await.unwrap().snapshot;
+        let (shown, other) = pages.unwrap();
+        let desktop = Desktop::new().unwrap();
+        assert!(desktop.show_page(&snapshot, Some(shown)).await.unwrap());
+        let shown_generation = desktop.canvas_state().generation;
+
+        let add_group = |snapshot: &Snapshot, page| {
+            snapshot
+                .patch(|edit| {
+                    let group = edit.add_entity(page, At::End)?;
+                    edit.set(
+                        group,
+                        &Group {
+                            origin: Origin::User,
+                            name: "group".to_owned(),
+                        },
+                    )
+                })
+                .unwrap()
+        };
+        let elsewhere = session.commit(add_group(&snapshot, other)).await.unwrap();
+        desktop
+            .synchronize(&elsewhere.snapshot, Some(shown), &elsewhere)
+            .await
+            .unwrap();
+        let canvas = desktop.canvas_state();
+        assert_eq!(canvas.generation, shown_generation);
+        assert_eq!(canvas.revision, Some(elsewhere.snapshot.revision()));
+        assert!(desktop.frame_manifest_bytes(canvas.generation).is_ok());
+
+        let here = session
+            .commit(add_group(&elsewhere.snapshot, shown))
+            .await
+            .unwrap();
+        desktop
+            .synchronize(&here.snapshot, Some(shown), &here)
+            .await
+            .unwrap();
+        let canvas = desktop.canvas_state();
+        assert_ne!(canvas.generation, shown_generation);
+        assert_eq!(canvas.revision, Some(here.snapshot.revision()));
     }
 }

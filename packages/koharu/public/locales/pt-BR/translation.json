@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "Sobre",
+    "batch": "Traduzir pastas em lote…",
     "closeProject": "Fechar projeto",
     "delete": "Excluir seleção",
     "discord": "Discord",

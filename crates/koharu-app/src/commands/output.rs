@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use image::{
-    ExtendedColorType, ImageEncoder as _,
+    ExtendedColorType, ImageEncoder as _, RgbaImage,
     codecs::png::{CompressionType, FilterType, PngEncoder},
 };
 use koharu_psd::{PsdExportOptions, export_page};
@@ -29,7 +29,7 @@ impl IpcResponse for ThumbnailBytes {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Type)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     Png,
@@ -67,7 +67,7 @@ pub(crate) async fn export(
     let Some(destination) = destination.map(|destination| destination.path().to_owned()) else {
         return Ok(());
     };
-    write(&desktop, snapshot, format, destination).await?;
+    write(&desktop, snapshot, &[format], destination).await?;
     Ok(())
 }
 
@@ -76,26 +76,26 @@ pub(crate) async fn export(
 /// exhausts memory.
 const EXPORT_CONCURRENCY: usize = 4;
 
-/// Renders every page of `snapshot` to `destination`: a folder for PNG and
-/// PSD, an archive path for CBZ.
+/// Renders every page of `snapshot` once and writes it to `destination` in
+/// each of `formats`: a folder for PNG and PSD, an archive path for CBZ.
 pub(crate) async fn write(
     desktop: &Desktop,
     snapshot: Snapshot,
-    format: ExportFormat,
+    formats: &[ExportFormat],
     destination: PathBuf,
 ) -> Result<()> {
     let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
     if pages.is_empty() {
         anyhow::bail!("there are no pages to export");
     }
+    let is_archive = formats.contains(&ExportFormat::Cbz);
+    if is_archive && formats.len() != 1 {
+        anyhow::bail!("a CBZ archive cannot be exported together with another format");
+    }
     let renderer = desktop.renderer();
     let rasterizer = desktop.rasterizer().await?;
     let options = PsdExportOptions::default();
-    let extension = match format {
-        ExportFormat::Png | ExportFormat::Cbz => "png",
-        ExportFormat::Psd => "psd",
-    };
-    let mut archive = if matches!(format, ExportFormat::Cbz) {
+    let mut archive = if is_archive {
         let directory = destination.parent().context("archive path has no parent")?;
         Some(zip::ZipWriter::new(tempfile::NamedTempFile::new_in(
             directory,
@@ -110,20 +110,45 @@ pub(crate) async fn write(
             let (renderer, snapshot, options) = (&renderer, &snapshot, &options);
             let rasterizer = Arc::clone(&rasterizer);
             async move {
+                // One prepared frame and its composite feed every format.
                 let frame = renderer.render(snapshot, page).await?;
-                match format {
-                    ExportFormat::Png | ExportFormat::Cbz => {
-                        tokio_rayon::spawn(move || encode_png(&rasterizer, &frame)).await
+                let mut merged = Some(
+                    rasterize(Arc::clone(&rasterizer), &frame, RasterOptions::default())
+                        .await?
+                        .image,
+                );
+                let mut files = Vec::with_capacity(formats.len());
+                for (index, format) in formats.iter().enumerate() {
+                    let composite = if index + 1 < formats.len() {
+                        merged.clone()
+                    } else {
+                        merged.take()
                     }
-                    ExportFormat::Psd => {
-                        Ok(export_page(rasterizer, snapshot, &frame, options).await?)
-                    }
+                    .expect("only the last format takes the composite");
+                    files.push(match format {
+                        ExportFormat::Png | ExportFormat::Cbz => (
+                            "png",
+                            tokio_rayon::spawn(move || encode_png(&composite)).await?,
+                        ),
+                        ExportFormat::Psd => (
+                            "psd",
+                            export_page(
+                                Arc::clone(&rasterizer),
+                                snapshot,
+                                &frame,
+                                composite,
+                                options,
+                            )
+                            .await?,
+                        ),
+                    });
                 }
+                anyhow::Ok(files)
             }
         })
         .buffered(EXPORT_CONCURRENCY);
     let mut index = 0;
-    while let Some(bytes) = encoded.try_next().await? {
+    while let Some(files) = encoded.try_next().await? {
         let page = snapshot.page(pages[index])?.page()?;
         let name = page
             .label
@@ -133,26 +158,28 @@ pub(crate) async fn write(
             .rsplit_once('.')
             .map_or(name, |(stem, _)| stem)
             .replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_");
-        let name = format!(
-            "{:0width$}_{}.{extension}",
-            index + 1,
-            if name.is_empty() { "page" } else { &name }
-        );
-        if let Some(mut writer) = archive.take() {
-            // Archive I/O is synchronous, so it runs off the async workers.
-            archive = Some(
-                tokio::task::spawn_blocking(move || -> Result<_> {
-                    // PNG data is already compressed.
-                    let options = zip::write::SimpleFileOptions::default()
-                        .compression_method(zip::CompressionMethod::Stored);
-                    writer.start_file(name, options)?;
-                    writer.write_all(&bytes)?;
-                    Ok(writer)
-                })
-                .await??,
+        for (extension, bytes) in files {
+            let name = format!(
+                "{:0width$}_{}.{extension}",
+                index + 1,
+                if name.is_empty() { "page" } else { &name }
             );
-        } else {
-            tokio::fs::write(destination.join(name), bytes).await?;
+            if let Some(mut writer) = archive.take() {
+                // Archive I/O is synchronous, so it runs off the async workers.
+                archive = Some(
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        // PNG data is already compressed.
+                        let options = zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Stored);
+                        writer.start_file(name, options)?;
+                        writer.write_all(&bytes)?;
+                        Ok(writer)
+                    })
+                    .await??,
+                );
+            } else {
+                tokio::fs::write(destination.join(name), bytes).await?;
+            }
         }
         index += 1;
     }
@@ -166,10 +193,7 @@ pub(crate) async fn write(
     Ok(())
 }
 
-fn encode_png(rasterizer: &Rasterizer, frame: &Frame) -> Result<Vec<u8>> {
-    let image = rasterizer
-        .rasterize(&frame.raster_frame()?, RasterOptions::default())?
-        .image;
+fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     PngEncoder::new_with_quality(&mut bytes, CompressionType::Best, FilterType::Adaptive)
         .write_image(
@@ -243,4 +267,115 @@ async fn rasterize(
     tokio_rayon::spawn(move || rasterizer.rasterize(&frame, options))
         .await
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use koharu_scene::{AssetInput, AssetMetadata, At, PageDraft, Session};
+
+    use super::*;
+
+    /// Counts the `Renderer::render` spans opened on the current thread.
+    struct Renders(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for Renders {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let metadata = span.metadata();
+            if metadata.name() == "render" && metadata.target() == "koharu_renderer::renderer" {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn batch_formats_render_each_page_once() {
+        let mut session = Session::memory().await.unwrap();
+        let source = AssetRole::new("source").unwrap();
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([10, 20, 200, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let png: Arc<[u8]> = png.into_inner().into();
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                for label in ["one", "two"] {
+                    let page = edit.add_page(PageDraft::new(label, 4.0, 4.0), At::End)?;
+                    edit.set_asset(
+                        page,
+                        &source,
+                        AssetInput::new(
+                            png.clone(),
+                            "image/png",
+                            AssetMetadata {
+                                width: Some(4),
+                                height: Some(4),
+                                attributes: BTreeMap::new(),
+                            },
+                        ),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let desktop = Desktop::new().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let renders = Arc::new(AtomicUsize::new(0));
+        let _counting = tracing::subscriber::set_default(Renders(Arc::clone(&renders)));
+
+        write(
+            &desktop,
+            snapshot,
+            &crate::commands::batch::FORMATS,
+            destination.path().to_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            2,
+            "each page renders once for both formats"
+        );
+        let mut names = std::fs::read_dir(destination.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "0001_one.png",
+                "0001_one.psd",
+                "0002_two.png",
+                "0002_two.psd"
+            ]
+        );
+    }
 }

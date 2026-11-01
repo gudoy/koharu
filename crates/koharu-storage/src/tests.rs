@@ -149,6 +149,122 @@ async fn garbage_collection_keeps_both_slots_and_active_states() {
 }
 
 #[tokio::test]
+async fn opening_a_project_reclaims_blobs_no_saved_state_references() {
+    let root = tempfile::tempdir().unwrap();
+    let session = Session::create(root.path(), DocumentId::new(), Bytes::new())
+        .await
+        .unwrap();
+    let initial = session.load().await.unwrap();
+    let orphan = Bytes::from_static(b"superseded");
+    let orphan_id = BlobId::for_bytes(&orphan);
+    let kept = Bytes::from_static(b"current");
+    let kept_id = BlobId::for_bytes(&kept);
+    let first = session
+        .save(
+            &initial
+                .update(
+                    Revision::new(1),
+                    Bytes::from_static(b"one"),
+                    [orphan_id],
+                    [(orphan_id, orphan)],
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .save(
+            &first
+                .update(
+                    Revision::new(2),
+                    Bytes::from_static(b"two"),
+                    [kept_id],
+                    [(kept_id, kept)],
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let third = session
+        .save(
+            &second
+                .update(
+                    Revision::new(3),
+                    Bytes::from_static(b"three"),
+                    [kept_id],
+                    [],
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop((initial, first, second, third, session));
+    assert!(blob_path(root.path(), orphan_id).exists());
+
+    let reopened = Session::open(root.path()).await.unwrap();
+
+    assert!(!blob_path(root.path(), orphan_id).exists());
+    assert!(blob_path(root.path(), kept_id).exists());
+    assert_eq!(reopened.revision(), Revision::new(3));
+}
+
+#[tokio::test]
+async fn an_unreadable_slot_keeps_every_blob() {
+    let root = tempfile::tempdir().unwrap();
+    let session = Session::create(root.path(), DocumentId::new(), Bytes::new())
+        .await
+        .unwrap();
+    let initial = session.load().await.unwrap();
+    let orphan = Bytes::from_static(b"superseded");
+    let orphan_id = BlobId::for_bytes(&orphan);
+    let first = session
+        .save(
+            &initial
+                .update(
+                    Revision::new(1),
+                    Bytes::from_static(b"one"),
+                    [orphan_id],
+                    [(orphan_id, orphan)],
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = session
+        .save(
+            &first
+                .update(Revision::new(2), Bytes::from_static(b"two"), [], [])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let third = session
+        .save(
+            &second
+                .update(Revision::new(3), Bytes::from_static(b"three"), [], [])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop((initial, first, second, third, session));
+    let slots = [crate::format::Slot::A, crate::format::Slot::B];
+    let older = slots
+        .into_iter()
+        .find(|slot| {
+            crate::format::load(root.path(), *slot)
+                .unwrap()
+                .is_some_and(|state| state.revision == Revision::new(2))
+        })
+        .unwrap();
+    std::fs::write(crate::format::path(root.path(), older), b"torn write").unwrap();
+
+    let reopened = Session::open(root.path()).await.unwrap();
+
+    assert_eq!(reopened.revision(), Revision::new(3));
+    assert!(blob_path(root.path(), orphan_id).exists());
+}
+
+#[tokio::test]
 async fn rejects_stale_saves() {
     let session = Session::memory(DocumentId::new(), Bytes::new())
         .await

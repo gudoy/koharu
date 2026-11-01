@@ -60,7 +60,7 @@ impl Default for RoremMixedConfig {
 }
 
 pub(super) struct Processor {
-    config: InpaintingModel,
+    pub(super) config: InpaintingModel,
     device: koharu_ml::Device,
     model: ModelCell<Model>,
 }
@@ -299,28 +299,36 @@ impl Model {
             edit.observe::<RasterLayer>(entity)?;
             edit.observe_assets(entity)?;
         }
-        let image = image.to_rgba8();
-        if image.dimensions() != original.dimensions() || image.dimensions() != mask.dimensions() {
-            bail!("inpainted image dimensions do not match page {page}");
-        }
-        let mut overlay = if manual {
-            cleanup.unwrap_or_else(|| RgbaImage::new(image.width(), image.height()))
-        } else {
-            RgbaImage::new(image.width(), image.height())
-        };
-        for (x, y, target) in overlay.enumerate_pixels_mut() {
-            if mask.get_pixel(x, y)[0] < 127 {
-                continue;
+        // Compositing and encoding the full-page overlay is CPU work, so it runs
+        // off the async workers like the inference above.
+        let (bytes, width, height) = tokio_rayon::spawn(move || -> Result<_> {
+            let image = image.to_rgba8();
+            if image.dimensions() != original.dimensions()
+                || image.dimensions() != mask.dimensions()
+            {
+                bail!("inpainted image dimensions do not match page {page}");
             }
-            let generated = image.get_pixel(x, y);
-            // Keep the complete cleanup mask opaque. Transparent texels next to
-            // edited pixels let linear canvas sampling reveal the artwork below.
-            *target = Rgba([generated[0], generated[1], generated[2], 255]);
-        }
-        let mut bytes = Cursor::new(Vec::new());
-        let width = overlay.width();
-        let height = overlay.height();
-        DynamicImage::ImageRgba8(overlay).write_to(&mut bytes, ImageFormat::Png)?;
+            let mut overlay = if manual {
+                cleanup.unwrap_or_else(|| RgbaImage::new(image.width(), image.height()))
+            } else {
+                RgbaImage::new(image.width(), image.height())
+            };
+            for (x, y, target) in overlay.enumerate_pixels_mut() {
+                if mask.get_pixel(x, y)[0] < 127 {
+                    continue;
+                }
+                let generated = image.get_pixel(x, y);
+                // Keep the complete cleanup mask opaque. Transparent texels next to
+                // edited pixels let linear canvas sampling reveal the artwork below.
+                *target = Rgba([generated[0], generated[1], generated[2], 255]);
+            }
+            let mut bytes = Cursor::new(Vec::new());
+            let width = overlay.width();
+            let height = overlay.height();
+            DynamicImage::ImageRgba8(overlay).write_to(&mut bytes, ImageFormat::Png)?;
+            Ok((bytes, width, height))
+        })
+        .await?;
         let cleanup_entity = if let Some(entity) = cleanup_entity {
             if manual {
                 let mut layer = input
@@ -966,6 +974,7 @@ mod tests {
                 page,
                 png: encode(&DynamicImage::ImageLuma8(transient)),
             }),
+            crate::StopToken::default(),
         );
 
         let prepared = prepare(&input).await.unwrap();
@@ -1020,6 +1029,7 @@ mod tests {
             None,
             Arc::new(crate::ImageCache::default()),
             None,
+            crate::StopToken::default(),
         );
         let manual = StageInput::new(
             snapshot,
@@ -1031,6 +1041,7 @@ mod tests {
                 page,
                 png: Arc::<[u8]>::from([]),
             }),
+            crate::StopToken::default(),
         );
         let processor = Processor::new(InpaintingModel::LaMa {}, koharu_ml::Device::cpu()).unwrap();
 

@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{Stage, resources::ResourceMonitor, stages::Stages};
 
+#[derive(Clone)]
 pub(crate) struct AcceleratorGate {
     resources: Arc<ResourceMonitor>,
     lane: Option<Arc<tokio::sync::Semaphore>>,

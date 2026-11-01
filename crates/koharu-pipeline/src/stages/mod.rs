@@ -12,7 +12,7 @@ use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
 
-use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, Stage};
+use crate::{Bounds, ImageCache, InpaintingMask, PipelineConfig, Stage, StopToken};
 
 #[derive(Clone)]
 pub(crate) struct StageInput {
@@ -22,6 +22,7 @@ pub(crate) struct StageInput {
     region: Option<Bounds>,
     images: Arc<ImageCache>,
     inpainting_mask: Option<InpaintingMask>,
+    stop: StopToken,
 }
 
 impl StageInput {
@@ -32,6 +33,7 @@ impl StageInput {
         region: Option<Bounds>,
         images: Arc<ImageCache>,
         inpainting_mask: Option<InpaintingMask>,
+        stop: StopToken,
     ) -> Self {
         Self {
             scene,
@@ -40,11 +42,16 @@ impl StageInput {
             region,
             images,
             inpainting_mask,
+            stop,
         }
     }
 
     pub(crate) fn page(&self) -> EntityId {
         self.page
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.stopped()
     }
 
     fn contains_entity(&self, entity: EntityId) -> Result<bool> {
@@ -59,7 +66,7 @@ impl StageInput {
 }
 
 #[async_trait]
-trait StageProcessor: Send + Sync {
+pub(crate) trait StageProcessor: Send + Sync {
     fn model(&self) -> &'static str;
     fn skip(&self, _input: &StageInput) -> Result<bool> {
         Ok(false)
@@ -70,10 +77,12 @@ trait StageProcessor: Send + Sync {
 }
 
 pub(crate) struct Stages {
-    detection: detection::Processor,
-    ocr: ocr::Processor,
+    detection: Arc<detection::Processor>,
+    ocr: Arc<ocr::Processor>,
     translation: translation::Processor,
-    inpainting: inpainting::Processor,
+    inpainting: Arc<inpainting::Processor>,
+    #[cfg(test)]
+    test_processor: Option<Arc<dyn StageProcessor>>,
 }
 
 impl Stages {
@@ -83,19 +92,59 @@ impl Stages {
         device: &koharu_ml::Device,
     ) -> Result<Self> {
         Ok(Self {
-            detection: detection::Processor::new(config.detection()?, device.clone()),
-            ocr: ocr::Processor::new(config.ocr.clone(), device.clone()),
+            detection: Arc::new(detection::Processor::new(
+                config.detection()?,
+                device.clone(),
+            )),
+            ocr: Arc::new(ocr::Processor::new(config.ocr.clone(), device.clone())),
             translation: translation::Processor::new(config.translation.clone(), translator),
-            inpainting: inpainting::Processor::new(config.inpainting()?, device.clone())?,
+            inpainting: Arc::new(inpainting::Processor::new(
+                config.inpainting()?,
+                device.clone(),
+            )?),
+            #[cfg(test)]
+            test_processor: None,
         })
     }
 
+    /// Builds the stages for `config`, keeping every processor whose settings
+    /// are unchanged so its loaded model survives the reload. Translation is
+    /// always rebuilt: its model lives in the shared translator.
+    pub(crate) fn reconfigure(
+        &self,
+        config: &PipelineConfig,
+        translator: koharu_translator::Translator,
+        device: &koharu_ml::Device,
+    ) -> Result<Self> {
+        let mut next = Self::new(config, translator, device)?;
+        if next.detection.config == self.detection.config {
+            next.detection = self.detection.clone();
+        }
+        if next.ocr.config == self.ocr.config {
+            next.ocr = self.ocr.clone();
+        }
+        if next.inpainting.config == self.inpainting.config {
+            next.inpainting = self.inpainting.clone();
+        }
+        Ok(next)
+    }
+
+    /// Routes every stage to `processor` so runner tests need no model weights.
+    #[cfg(test)]
+    pub(crate) fn set_test_processor(&mut self, processor: Arc<dyn StageProcessor>) {
+        self.test_processor = Some(processor);
+    }
+
     fn processor(&self, stage: Stage) -> &dyn StageProcessor {
+        #[cfg(test)]
+        if let Some(processor) = self.test_processor.as_deref() {
+            return processor;
+        }
         match stage {
-            Stage::Detection => &self.detection,
-            Stage::Ocr => &self.ocr,
+            Stage::Detection => self.detection.as_ref(),
+            Stage::Ocr => self.ocr.as_ref(),
             Stage::Translation => &self.translation,
-            Stage::Inpainting => &self.inpainting,
+            Stage::Inpainting => self.inpainting.as_ref(),
         }
     }
 
@@ -117,6 +166,11 @@ impl Stages {
 
     pub(crate) fn unload(&self, stage: Stage) -> bool {
         self.processor(stage).unload()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_processor(&self, other: &Self, stage: Stage) -> bool {
+        std::ptr::addr_eq(self.processor(stage), other.processor(stage))
     }
 }
 

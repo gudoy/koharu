@@ -219,12 +219,17 @@ impl PreparedFrameBundle {
             .find(|resource| resource.id() == id)
             .cloned()
             .ok_or_else(|| Error::invalid(format!("prepared frame has no resource {id}")))?;
-        PreparedResourcePacket::from_resource(resource)
+        resource.validate_structure()?;
+        Ok(PreparedResourcePacket { resource })
     }
 
+    /// Checks structure only. Bundle resources are in-process values whose
+    /// content ids were computed when they were built;
+    /// `PreparedResourcePacket::decode` verifies ids where bytes cross the
+    /// process boundary.
     pub fn validate(&self) -> Result<()> {
         for resource in &self.resources {
-            resource.validate()?;
+            resource.validate_structure()?;
         }
         self.manifest().map(|_| ())
     }
@@ -770,6 +775,7 @@ impl PreparedResourceRef {
 pub enum PreparedResource {
     Font {
         id: ResourceId,
+        #[serde(with = "shared_bytes")]
         bytes: Arc<[u8]>,
     },
     EncodedRaster {
@@ -777,8 +783,46 @@ pub enum PreparedResource {
         width: u32,
         height: u32,
         media_type: String,
+        #[serde(with = "shared_bytes")]
         bytes: Arc<[u8]>,
     },
+}
+
+/// Serializes resource payloads as one byte string instead of a sequence of
+/// `u8` elements, so they are copied in bulk. Postcard writes both as a length
+/// prefix followed by the raw bytes, so the wire format and
+/// `PREPARED_RESOURCE_FORMAT_VERSION` are unchanged.
+mod shared_bytes {
+    use std::{fmt, sync::Arc};
+
+    use serde::{Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S: Serializer>(
+        bytes: &Arc<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<[u8]>, D::Error> {
+        deserializer.deserialize_bytes(Visitor)
+    }
+
+    struct Visitor;
+
+    impl de::Visitor<'_> for Visitor {
+        type Value = Arc<[u8]>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+            Ok(Arc::from(bytes))
+        }
+    }
 }
 
 impl PreparedResource {
@@ -849,12 +893,31 @@ impl PreparedResource {
         Ok(resource)
     }
 
+    /// Builds an encoded raster whose `id` the caller already derived with
+    /// `ResourceId::for_encoded_raster` from these fields. Checks structure
+    /// only; `PreparedResourcePacket::decode` verifies the id.
+    pub fn encoded_raster_with_id(
+        id: ResourceId,
+        width: u32,
+        height: u32,
+        media_type: impl Into<String>,
+        bytes: Arc<[u8]>,
+    ) -> Result<Self> {
+        let resource = Self::EncodedRaster {
+            id,
+            width,
+            height,
+            media_type: media_type.into(),
+            bytes,
+        };
+        resource.validate_structure()?;
+        Ok(resource)
+    }
+
     fn validate(&self) -> Result<()> {
+        self.validate_structure()?;
         match self {
             Self::Font { id, bytes } => {
-                if bytes.is_empty() {
-                    return Err(Error::invalid("font resource is empty"));
-                }
                 if *id != ResourceId::for_font(bytes) {
                     return Err(Error::invalid("font resource content id does not match"));
                 }
@@ -866,6 +929,30 @@ impl PreparedResource {
                 media_type,
                 bytes,
             } => {
+                if *id != ResourceId::for_encoded_raster(*width, *height, media_type, bytes) {
+                    return Err(Error::invalid(
+                        "encoded raster resource content id does not match",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        match self {
+            Self::Font { bytes, .. } => {
+                if bytes.is_empty() {
+                    return Err(Error::invalid("font resource is empty"));
+                }
+            }
+            Self::EncodedRaster {
+                width,
+                height,
+                media_type,
+                bytes,
+                ..
+            } => {
                 validate_surface(*width, *height)?;
                 if bytes.is_empty() {
                     return Err(Error::invalid("encoded raster resource is empty"));
@@ -876,11 +963,6 @@ impl PreparedResource {
                     || media_type.contains('\0')
                 {
                     return Err(Error::invalid("encoded raster media type is invalid"));
-                }
-                if *id != ResourceId::for_encoded_raster(*width, *height, media_type, bytes) {
-                    return Err(Error::invalid(
-                        "encoded raster resource content id does not match",
-                    ));
                 }
             }
         }
@@ -1080,6 +1162,32 @@ mod tests {
             PreparedResourcePacket::decode(&bytes),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn trusted_bundle_defers_content_id_check_to_decode_boundary() {
+        let mut bundle = bundle();
+        let PreparedResource::EncodedRaster { bytes, .. } = &mut bundle.resources[0] else {
+            unreachable!()
+        };
+        Arc::make_mut(bytes)[0] = 0;
+        let id = bundle.resources[0].id();
+
+        let packet = bundle.resource_packet(id).unwrap();
+        assert!(matches!(
+            PreparedResourcePacket::decode(&packet.encode().unwrap()),
+            Err(Error::Invalid(_))
+        ));
+        bundle
+            .clone()
+            .into_frame_with_raster_sources(&HashMap::from([(id, Arc::from(&[0; 4][..]))]))
+            .unwrap();
+
+        let PreparedResource::EncodedRaster { media_type, .. } = &mut bundle.resources[0] else {
+            unreachable!()
+        };
+        media_type.clear();
+        assert!(matches!(bundle.resource_packet(id), Err(Error::Invalid(_))));
     }
 
     #[test]

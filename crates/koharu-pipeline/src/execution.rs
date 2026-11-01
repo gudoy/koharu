@@ -144,8 +144,8 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .filter(|mask| stage == Stage::Inpainting && mask.page == page)
                     .cloned(),
+                self.stop.clone(),
             ),
-            self.stop.clone(),
             self.progress.clone(),
         ))
     }

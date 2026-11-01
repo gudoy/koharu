@@ -1,6 +1,96 @@
 use std::collections::{HashMap, HashSet};
 
-use koharu_rasterizer::ResourceId;
+use koharu_rasterizer::{LayerId, PreparedFrameManifest, ResourceId};
+
+const RESOURCE_CACHE_BUDGET: u64 = 512 * 1024 * 1024;
+const MAX_CACHED_RESOURCES: usize = 1_024;
+
+/// Prepared resources held in CPU and GPU memory.
+pub(crate) trait ResidentResources {
+    fn resident_bytes(&self) -> u64;
+    fn release(&mut self, resource: ResourceId);
+}
+
+/// Manifests of shown and prefetched pages, kept so a page switch can activate without a fetch.
+#[derive(Default)]
+pub(crate) struct PageManifests {
+    entries: HashMap<LayerId, CachedManifest>,
+    clock: u64,
+}
+
+struct CachedManifest {
+    manifest: PreparedFrameManifest,
+    used: u64,
+}
+
+impl PageManifests {
+    pub(crate) fn get(&self, page: &LayerId) -> Option<&PreparedFrameManifest> {
+        self.entries.get(page).map(|entry| &entry.manifest)
+    }
+
+    pub(crate) fn insert(&mut self, page: LayerId, manifest: PreparedFrameManifest) {
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(
+            page,
+            CachedManifest {
+                manifest,
+                used: self.clock,
+            },
+        );
+    }
+
+    fn resources(&self) -> impl Iterator<Item = ResourceId> + '_ {
+        self.entries.values().flat_map(|entry| {
+            entry
+                .manifest
+                .required_resources()
+                .iter()
+                .map(|resource| resource.id)
+        })
+    }
+
+    /// Drops the least recently used page that holds a resource outside `pinned`. Dropping a
+    /// page whose resources are all pinned, such as the active one, would free nothing.
+    fn drop_least_recent(&mut self, pinned: &HashSet<ResourceId>) -> bool {
+        let page = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .manifest
+                    .required_resources()
+                    .iter()
+                    .any(|resource| !pinned.contains(&resource.id))
+            })
+            .min_by_key(|(_, entry)| entry.used)
+            .map(|(page, _)| *page);
+        page.is_some_and(|page| self.entries.remove(&page).is_some())
+    }
+}
+
+/// Releases least-recently-used resources while the canvas exceeds its budget. Resources in
+/// `pinned` (the active and staged frames) stay resident. Cached pages keep theirs until the
+/// budget forces the least recently used page out; switching back to it prepares it again.
+pub(crate) fn evict(
+    resident: &mut impl ResidentResources,
+    usage: &mut ResourceUsage,
+    manifests: &mut PageManifests,
+    pinned: &HashSet<ResourceId>,
+) {
+    let mut protected = pinned.clone();
+    protected.extend(manifests.resources());
+    while resident.resident_bytes() > RESOURCE_CACHE_BUDGET || usage.len() > MAX_CACHED_RESOURCES {
+        if let Some(candidate) = usage.oldest_unprotected(&protected) {
+            resident.release(candidate);
+            usage.remove(candidate);
+        } else if manifests.drop_least_recent(pinned) {
+            protected.clone_from(pinned);
+            protected.extend(manifests.resources());
+        } else {
+            break;
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct ResourceUsage {
@@ -39,10 +129,105 @@ impl ResourceUsage {
 
 #[cfg(test)]
 mod tests {
+    use koharu_rasterizer::{PreparedFrame, PreparedResourceKind, PreparedResourceRef, Revision};
+
     use super::*;
+
+    /// One 4096x4096 RGBA raster, the size of a decoded scan on the GPU.
+    const PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
     fn id(value: u8) -> ResourceId {
         ResourceId::from_bytes([value; 32])
+    }
+
+    fn page(value: u8) -> LayerId {
+        LayerId::from_bytes([value; 16])
+    }
+
+    fn manifest(value: u8) -> PreparedFrameManifest {
+        PreparedFrameManifest {
+            frame: PreparedFrame {
+                revision: Revision::new(1),
+                page: page(value),
+                width: 4096,
+                height: 4096,
+                origin: (0, 0),
+                normalization: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                layers: Vec::new(),
+            },
+            resources: vec![PreparedResourceRef {
+                id: id(value),
+                kind: PreparedResourceKind::EncodedRaster {
+                    width: 4096,
+                    height: 4096,
+                },
+                byte_len: PAGE_BYTES,
+            }],
+        }
+    }
+
+    impl ResidentResources for HashMap<ResourceId, u64> {
+        fn resident_bytes(&self) -> u64 {
+            self.values().sum()
+        }
+
+        fn release(&mut self, resource: ResourceId) {
+            self.remove(&resource);
+        }
+    }
+
+    #[derive(Default)]
+    struct Canvas {
+        resident: HashMap<ResourceId, u64>,
+        usage: ResourceUsage,
+        pages: PageManifests,
+    }
+
+    impl Canvas {
+        /// Caches page `value` while page `active` is on screen, as activation and prefetch do.
+        fn cache(&mut self, value: u8, active: u8) {
+            self.resident.insert(id(value), PAGE_BYTES);
+            self.usage.insert(id(value));
+            self.pages.insert(page(value), manifest(value));
+            evict(
+                &mut self.resident,
+                &mut self.usage,
+                &mut self.pages,
+                &HashSet::from([id(active)]),
+            );
+        }
+
+        fn cached_pages(&self) -> Vec<u8> {
+            (1..=u8::MAX)
+                .filter(|value| self.pages.get(&page(*value)).is_some())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn browsing_past_the_budget_drops_the_least_recently_shown_pages() {
+        let mut canvas = Canvas::default();
+        for value in 1..=8 {
+            canvas.cache(value, value);
+        }
+        canvas.cache(1, 1);
+        for value in 9..=12 {
+            canvas.cache(value, value);
+        }
+
+        assert_eq!(canvas.cached_pages(), [1, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(canvas.resident.resident_bytes(), RESOURCE_CACHE_BUDGET);
+    }
+
+    #[test]
+    fn prefetched_pages_never_drop_the_active_page() {
+        let mut canvas = Canvas::default();
+        canvas.cache(1, 1);
+        for value in 2..=10 {
+            canvas.cache(value, 1);
+        }
+
+        assert_eq!(canvas.cached_pages(), [1, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]

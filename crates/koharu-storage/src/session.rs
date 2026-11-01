@@ -122,9 +122,25 @@ impl Session {
     #[tracing::instrument(level = "info", skip_all, fields(path = %path.as_ref().display()))]
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        tokio::task::spawn_blocking(move || open_project(path, None))
+        let session = tokio::task::spawn_blocking(move || open_project(path, None))
             .await
-            .context("project open task failed")?
+            .context("project open task failed")??;
+        // Undo history lives only in memory, so before any state is loaded the
+        // two saved slots are the only owners of blobs. Anything else was
+        // superseded in an earlier session, or published by a save that never
+        // completed.
+        match session.collect_garbage().await {
+            Ok(report) if report.blobs > 0 => {
+                tracing::info!(
+                    blobs = report.blobs,
+                    bytes = report.bytes,
+                    "reclaimed unreferenced blobs"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "failed to reclaim unreferenced blobs"),
+        }
+        Ok(session)
     }
 
     pub async fn memory(document: DocumentId, payload: Bytes) -> Result<Self> {
@@ -228,10 +244,13 @@ impl Session {
         let _writer = self.inner.writer.lock().await;
         let root = self.inner.root.clone();
         let store = self.inner.blobs.clone();
+        let head = self.inner.head.read().stored.clone();
         tokio::task::spawn_blocking(move || {
-            let mut saved = BTreeSet::new();
+            let mut saved = head.blobs.iter().copied().collect::<BTreeSet<_>>();
             for slot in [Slot::A, Slot::B] {
-                if let Ok(Some(state)) = format::load(&root, slot) {
+                // A slot that exists but cannot be read may still own blobs, so
+                // collect nothing rather than risk deleting them.
+                if let Some(state) = format::load(&root, slot)? {
                     saved.extend(state.blobs);
                 }
             }

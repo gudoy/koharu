@@ -9,6 +9,15 @@ pub enum PsdExportError {
         page: koharu_scene::EntityId,
         role: &'static str,
     },
+    #[error(
+        "merged composite is {width}x{height} but the frame is {expected_width}x{expected_height}"
+    )]
+    MismatchedComposite {
+        width: u32,
+        height: u32,
+        expected_width: u32,
+        expected_height: u32,
+    },
     #[error("renderer did not produce pixels for scene entity {0}")]
     MissingRenderedEntity(koharu_scene::EntityId),
     #[error("PSD layer count exceeds the classic format limit: {0}")]

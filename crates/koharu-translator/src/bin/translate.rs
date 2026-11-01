@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         request = request.with_instructions(instructions);
     }
     let (_, translated) = translator
-        .translate(&selection, GenerationConfig::default(), request)
+        .translate(&selection, GenerationConfig::default(), request, || false)
         .await?;
 
     if args.json {

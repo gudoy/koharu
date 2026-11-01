@@ -9,11 +9,12 @@ import {
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from 'next-themes'
-import { StrictMode, type ReactNode } from 'react'
+import { Profiler, StrictMode, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { TitleBar } from '@/components/app/TitleBar'
 import { WindowControls } from '@/components/app/WindowChrome'
+import { ModelPicker } from '@/components/controls/ModelPicker'
 import { ActivityCenter } from '@/components/editor/ActivityCenter'
 import { CanvasCommandBar } from '@/components/editor/CanvasCommandBar'
 import { Inspector } from '@/components/editor/Inspector'
@@ -31,12 +32,14 @@ import {
   projectKey,
   queryClient,
   useCommand,
+  usePage,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
 import * as canvasRuntime from '@koharu/bridge/canvas'
 import {
   commands,
   type Layer,
+  type Page,
   type PageSummary,
   type Preferences,
   type ProjectInfo,
@@ -479,6 +482,35 @@ describe('greenfield editor', () => {
     expect(screen.queryByText('01')).not.toBeInTheDocument()
   })
 
+  it('does not re-render the page rail when the open page is edited', async () => {
+    installProject()
+    vi.spyOn(commands, 'getThumbnail').mockResolvedValue([1])
+    const railRender = vi.fn()
+    function OpenPageLayers() {
+      return <output aria-label='Open page layers'>{usePage().data?.layers.length}</output>
+    }
+    render(
+      <>
+        <Profiler id='rail' onRender={railRender}>
+          <PageRail />
+        </Profiler>
+        <OpenPageLayers />
+      </>,
+    )
+    await screen.findByRole('img', { name: 'Page 1' })
+    railRender.mockClear()
+
+    const page = queryClient.getQueryData<Page>(pageKey)!
+    act(() => {
+      queryClient.setQueryData(pageKey, { ...page, layers: [textLayer, secondLayer] })
+    })
+
+    await waitFor(() =>
+      expect(screen.getByRole('status', { name: 'Open page layers' })).toHaveTextContent('2'),
+    )
+    expect(railRender).not.toHaveBeenCalled()
+  })
+
   it('keeps rapid page switches on the latest native selection', async () => {
     installProject()
     const pages = [
@@ -624,6 +656,53 @@ describe('greenfield editor', () => {
     expect(selectPage).not.toHaveBeenCalled()
   })
 
+  it('does not prefetch pages the pointer only sweeps across', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      ...(queryClient.getQueryData<PageSummary[]>(pagesKey) ?? []),
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1500 },
+        source_asset: null,
+        layer_count: 0,
+      },
+    ])
+    const prefetch = vi.spyOn(canvasRuntime, 'prefetchCanvasPages').mockResolvedValue([])
+    render(<PageRail />)
+    const item = screen.getByText('Page 2').closest('article')!
+
+    fireEvent.pointerEnter(item)
+    fireEvent.pointerLeave(item)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    expect(prefetch).not.toHaveBeenCalled()
+  })
+
+  it('does not prefetch a page the pointer clicks before the hover intent fires', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      ...(queryClient.getQueryData<PageSummary[]>(pagesKey) ?? []),
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1500 },
+        source_asset: null,
+        layer_count: 0,
+      },
+    ])
+    const prefetch = vi.spyOn(canvasRuntime, 'prefetchCanvasPages').mockResolvedValue([])
+    vi.spyOn(commands, 'selectPage')
+    render(<PageRail />)
+    const item = screen.getByText('Page 2').closest('article')!
+
+    fireEvent.pointerEnter(item)
+    fireEvent.click(item)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    expect(prefetch).not.toHaveBeenCalled()
+  })
+
   it('deduplicates page intent within a project revision and retries on a newer revision', async () => {
     installProject()
     const page = {
@@ -654,6 +733,8 @@ describe('greenfield editor', () => {
     fireEvent.focus(screen.getByRole('button', { name: 'Actions for Page 2' }))
     await waitFor(() => expect(prefetch).toHaveBeenCalledTimes(1))
     fireEvent.pointerEnter(item)
+    // Let the hover intent fire so the deduplication is what keeps the count.
+    await new Promise((resolve) => setTimeout(resolve, 200))
     expect(prefetch).toHaveBeenCalledTimes(1)
 
     queryClient.setQueryData(projectKey, {
@@ -1286,6 +1367,61 @@ describe('greenfield editor', () => {
     )
   })
 
+  it('mounts only the visible rows of a large model catalogue', () => {
+    const models = Array.from({ length: 500 }, (_, index) => ({
+      provider: 'openrouter' as const,
+      model: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      quantizations:
+        index === 499
+          ? [
+              { id: 'q4', name: 'Q4_K_M', downloaded: false },
+              { id: 'q8', name: 'Q8_0', downloaded: true },
+            ]
+          : [],
+      vision: false,
+      reasoning: false,
+    }))
+    const onSelect = vi.fn()
+    render(
+      <ModelPicker
+        value={null}
+        models={models}
+        providers={preferences.providers.entries}
+        onBack={() => undefined}
+        onSelect={onSelect}
+      />,
+    )
+
+    const rows = () => screen.getAllByRole('button', { name: /^Use Model \d+ from/ })
+    expect(rows().length).toBeLessThanOrEqual(40)
+
+    // jsdom has no layout and does not clamp scrollTop, so scrolling by the full
+    // list height lands the window on the last rows.
+    const viewport = rows()[0]!.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')!
+    const list = rows()[0]!.parentElement!.parentElement!
+    fireEvent.scroll(viewport, { target: { scrollTop: parseFloat(list.style.height) } })
+    expect(screen.queryByRole('button', { name: /^Use Model 0 from/ })).toBeNull()
+    expect(rows().length).toBeLessThanOrEqual(40)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 498 from/ }))
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'vendor/model-498', quantization: null }),
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 49' },
+    })
+    expect(screen.getByRole('button', { name: /^Use Model 499 from/ })).toBeInTheDocument()
+    for (const row of rows()) expect(row).toHaveAccessibleName(/^Use Model 49\d? from/)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 499' },
+    })
+    expect(screen.getAllByRole('button', { name: /^Use Model \d+ from/ })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 499 from/ }))
+    expect(screen.getByRole('button', { name: 'Q4_K_M' })).toHaveFocus()
+  })
+
   it('constrains long model names inside the runtime selector', async () => {
     installProject()
     const longName = 'Llama 3.2 8x3b Moe Dark Champion Instruct Uncensored Abliterated 18.4b'
@@ -1754,6 +1890,35 @@ describe('greenfield editor', () => {
     render(<ResourceMonitor />)
     expect(screen.getByText('8%')).toBeInTheDocument()
     expect(screen.getByText('3%')).toBeInTheDocument()
+  })
+
+  it('re-renders model resources only when a displayed value changes', () => {
+    const sample = (cpu: number, memory: number) => ({
+      process_memory: memory,
+      system_memory: 64 * 1024 ** 3,
+      process_cpu: cpu,
+      devices: [],
+    })
+    useKoharuStore.setState({ resources: sample(8.1, 2 * 1024 ** 3) })
+    let renders = 0
+    render(
+      <Profiler id='resources' onRender={() => renders++}>
+        <ResourceMonitor />
+      </Profiler>,
+    )
+    const initial = renders
+
+    // Telemetry arrives every 100 ms; these samples all display as 8% and 2.0 GB.
+    for (let tick = 1; tick <= 10; tick++) {
+      act(() =>
+        useKoharuStore.setState({ resources: sample(8.1 + tick / 100, 2 * 1024 ** 3 + tick) }),
+      )
+    }
+    expect(renders).toBe(initial)
+
+    act(() => useKoharuStore.setState({ resources: sample(12, 2 * 1024 ** 3) }))
+    expect(renders).toBe(initial + 1)
+    expect(screen.getByText('12%')).toBeInTheDocument()
   })
 
   it('tracks arbitrary concurrent commands until each one settles', async () => {

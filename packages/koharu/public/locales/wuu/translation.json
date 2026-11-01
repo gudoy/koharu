@@ -245,6 +245,7 @@
   },
   "menu": {
     "about": "关于",
+    "batch": "批量翻译文件夹…",
     "closeProject": "关闭项目",
     "delete": "删除拣中个内容",
     "discord": "Discord",

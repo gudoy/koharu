@@ -7,14 +7,18 @@ import { TitleBar } from '@/components/app/TitleBar'
 import { Editor } from '@/components/editor/Editor'
 import { SettingsPage } from '@/components/preferences/SettingsPage'
 import { StartView } from '@/components/start/StartView'
-import { useProject } from '@/lib/queries'
+import { useProjectSelect } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import type { ProjectInfo } from '@koharu/bridge/protocol'
 import { cn } from '@koharu/ui/lib/utils'
+
+const selectActivePage = (project: ProjectInfo | null) =>
+  project && { active_page: project.active_page }
 
 export function KoharuApp() {
   const { t } = useTranslation()
-  const project = useProject().data
-  const selectedPages = useKoharuStore((state) => state.selectedPages)
+  const project = useProjectSelect(selectActivePage)
+  const hasSelectedPages = useKoharuStore((state) => state.selectedPages.length > 0)
   const selectPages = useKoharuStore((state) => state.selectPages)
   const selectLayers = useKoharuStore((state) => state.selectLayers)
   const projectLoaded = project !== undefined
@@ -23,10 +27,10 @@ export function KoharuApp() {
   const editorOpen = project !== undefined && project !== null && !settingsOpen
 
   useEffect(() => {
-    if (!projectLoaded || selectedPages.length > 0) return
+    if (!projectLoaded || hasSelectedPages) return
     selectPages(activePage ? [activePage] : [])
     selectLayers([])
-  }, [activePage, projectLoaded, selectLayers, selectPages, selectedPages.length])
+  }, [activePage, projectLoaded, selectLayers, selectPages, hasSelectedPages])
 
   return (
     <div
