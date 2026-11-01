@@ -770,6 +770,7 @@ impl PreparedResourceRef {
 pub enum PreparedResource {
     Font {
         id: ResourceId,
+        #[serde(with = "shared_bytes")]
         bytes: Arc<[u8]>,
     },
     EncodedRaster {
@@ -777,8 +778,46 @@ pub enum PreparedResource {
         width: u32,
         height: u32,
         media_type: String,
+        #[serde(with = "shared_bytes")]
         bytes: Arc<[u8]>,
     },
+}
+
+/// Serializes resource payloads as one byte string instead of a sequence of
+/// `u8` elements, so they are copied in bulk. Postcard writes both as a length
+/// prefix followed by the raw bytes, so the wire format and
+/// `PREPARED_RESOURCE_FORMAT_VERSION` are unchanged.
+mod shared_bytes {
+    use std::{fmt, sync::Arc};
+
+    use serde::{Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S: Serializer>(
+        bytes: &Arc<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<[u8]>, D::Error> {
+        deserializer.deserialize_bytes(Visitor)
+    }
+
+    struct Visitor;
+
+    impl de::Visitor<'_> for Visitor {
+        type Value = Arc<[u8]>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+            Ok(Arc::from(bytes))
+        }
+    }
 }
 
 impl PreparedResource {
