@@ -624,6 +624,29 @@ describe('greenfield editor', () => {
     expect(selectPage).not.toHaveBeenCalled()
   })
 
+  it('does not prefetch pages the pointer only sweeps across', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      ...(queryClient.getQueryData<PageSummary[]>(pagesKey) ?? []),
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1500 },
+        source_asset: null,
+        layer_count: 0,
+      },
+    ])
+    const prefetch = vi.spyOn(canvasRuntime, 'prefetchCanvasPages').mockResolvedValue([])
+    render(<PageRail />)
+    const item = screen.getByText('Page 2').closest('article')!
+
+    fireEvent.pointerEnter(item)
+    fireEvent.pointerLeave(item)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    expect(prefetch).not.toHaveBeenCalled()
+  })
+
   it('deduplicates page intent within a project revision and retries on a newer revision', async () => {
     installProject()
     const page = {
