@@ -364,6 +364,33 @@ async fn staged_revisions_publish_only_with_a_commit_or_persist() {
 }
 
 #[tokio::test]
+async fn staging_rejects_new_blob_content() {
+    let mut session = Session::memory().await.unwrap();
+    let patch = session
+        .snapshot()
+        .patch(|edit| {
+            let page = edit.add_page(page(), At::End)?;
+            edit.set_asset(
+                page,
+                &AssetRole::new("source")?,
+                AssetInput::new(
+                    Arc::<[u8]>::from(&b"staged"[..]),
+                    "image/test",
+                    AssetMetadata {
+                        width: None,
+                        height: None,
+                        attributes: BTreeMap::new(),
+                    },
+                ),
+            )
+        })
+        .unwrap();
+    let revision = session.snapshot().revision();
+    assert!(matches!(session.stage(patch).await, Err(Error::Invalid(_))));
+    assert_eq!(session.snapshot().revision(), revision);
+}
+
+#[tokio::test]
 async fn stale_disjoint_patches_can_rebase_without_hiding_conflicts() {
     let mut session = Session::memory().await.unwrap();
     let mut entities = None;

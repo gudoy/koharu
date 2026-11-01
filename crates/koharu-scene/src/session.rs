@@ -83,9 +83,14 @@ impl Session {
 
     /// Applies `patch` as an undoable in-memory revision without publishing it.
     /// The next commit or [`Session::persist`] publishes it with the complete
-    /// state; until then a crash loses it.
+    /// state; until then a crash loses it. A staged patch cannot attach blob
+    /// content: undo carries no bytes, so a staged blob replaced before it was
+    /// published could not be restored.
     #[tracing::instrument(level = "info", skip_all, fields(project = %self.project_id(), base = %patch.base_revision))]
     pub async fn stage(&mut self, patch: Patch) -> Result<Commit> {
+        if !patch.attachments.is_empty() {
+            return Err(Error::invalid("a staged patch cannot attach blob content"));
+        }
         self.apply(patch, false).await
     }
 
