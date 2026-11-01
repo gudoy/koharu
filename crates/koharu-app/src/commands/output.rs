@@ -67,7 +67,7 @@ pub(crate) async fn export(
     let Some(destination) = destination.map(|destination| destination.path().to_owned()) else {
         return Ok(());
     };
-    write(&desktop, snapshot, format, destination).await?;
+    write(&desktop, snapshot, &[format], destination).await?;
     Ok(())
 }
 
@@ -76,9 +76,21 @@ pub(crate) async fn export(
 /// exhausts memory.
 const EXPORT_CONCURRENCY: usize = 4;
 
-/// Renders every page of `snapshot` to `destination`: a folder for PNG and
-/// PSD, an archive path for CBZ.
+/// Renders every page of `snapshot` to `destination` in each of `formats`: a
+/// folder for PNG and PSD, an archive path for CBZ.
 pub(crate) async fn write(
+    desktop: &Desktop,
+    snapshot: Snapshot,
+    formats: &[ExportFormat],
+    destination: PathBuf,
+) -> Result<()> {
+    for format in formats {
+        write_format(desktop, snapshot.clone(), *format, destination.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn write_format(
     desktop: &Desktop,
     snapshot: Snapshot,
     format: ExportFormat,
@@ -243,4 +255,115 @@ async fn rasterize(
     tokio_rayon::spawn(move || rasterizer.rasterize(&frame, options))
         .await
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use koharu_scene::{AssetInput, AssetMetadata, At, PageDraft, Session};
+
+    use super::*;
+
+    /// Counts the `Renderer::render` spans opened on the current thread.
+    struct Renders(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for Renders {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let metadata = span.metadata();
+            if metadata.name() == "render" && metadata.target() == "koharu_renderer::renderer" {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn batch_formats_render_each_page_once() {
+        let mut session = Session::memory().await.unwrap();
+        let source = AssetRole::new("source").unwrap();
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([10, 20, 200, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let png: Arc<[u8]> = png.into_inner().into();
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                for label in ["one", "two"] {
+                    let page = edit.add_page(PageDraft::new(label, 4.0, 4.0), At::End)?;
+                    edit.set_asset(
+                        page,
+                        &source,
+                        AssetInput::new(
+                            png.clone(),
+                            "image/png",
+                            AssetMetadata {
+                                width: Some(4),
+                                height: Some(4),
+                                attributes: BTreeMap::new(),
+                            },
+                        ),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let desktop = Desktop::new().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let renders = Arc::new(AtomicUsize::new(0));
+        let _counting = tracing::subscriber::set_default(Renders(Arc::clone(&renders)));
+
+        write(
+            &desktop,
+            snapshot,
+            &crate::commands::batch::FORMATS,
+            destination.path().to_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            2,
+            "each page renders once for both formats"
+        );
+        let mut names = std::fs::read_dir(destination.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "0001_one.png",
+                "0001_one.psd",
+                "0002_two.png",
+                "0002_two.psd"
+            ]
+        );
+    }
 }
