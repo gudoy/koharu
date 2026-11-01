@@ -1170,6 +1170,27 @@ mod tests {
     }
 
     #[test]
+    fn bucketed_spans_contain_the_original_span_inside_the_image() {
+        // Interior, near and far edges, an exact bucket, and an image
+        // narrower than one bucket.
+        for (start, end, limit) in [
+            (300, 500, 2000),
+            (0, 40, 2000),
+            (1100, 1200, 1200),
+            (1950, 2000, 2000),
+            (0, 512, 1000),
+            (100, 150, 150),
+        ] {
+            let (bucket_start, bucket_end) = bucket_span(start, end, limit);
+            let case = format!("{start}..{end} in {limit} -> {bucket_start}..{bucket_end}");
+            assert!(bucket_start <= start && end <= bucket_end, "{case}");
+            assert!(bucket_end <= limit, "{case}");
+            let length = bucket_end - bucket_start;
+            assert!(length % TILE_BUCKET == 0 || length == limit, "{case}");
+        }
+    }
+
+    #[test]
     fn oversized_component_tiles_mask_their_continuation_context() {
         let mut mask = GrayImage::new(1000, 300);
         for y in 100..120 {

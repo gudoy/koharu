@@ -138,19 +138,30 @@ pub(crate) async fn write(
             index + 1,
             if name.is_empty() { "page" } else { &name }
         );
-        if let Some(archive) = &mut archive {
-            // PNG data is already compressed.
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            archive.start_file(name, options)?;
-            archive.write_all(&bytes)?;
+        if let Some(mut writer) = archive.take() {
+            // Archive I/O is synchronous, so it runs off the async workers.
+            archive = Some(
+                tokio::task::spawn_blocking(move || -> Result<_> {
+                    // PNG data is already compressed.
+                    let options = zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored);
+                    writer.start_file(name, options)?;
+                    writer.write_all(&bytes)?;
+                    Ok(writer)
+                })
+                .await??,
+            );
         } else {
             tokio::fs::write(destination.join(name), bytes).await?;
         }
         index += 1;
     }
-    if let Some(archive) = archive {
-        archive.finish()?.persist(destination)?;
+    if let Some(writer) = archive {
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            writer.finish()?.persist(destination)?;
+            Ok(())
+        })
+        .await??;
     }
     Ok(())
 }
