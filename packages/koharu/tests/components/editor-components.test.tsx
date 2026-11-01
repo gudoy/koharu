@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { TitleBar } from '@/components/app/TitleBar'
 import { WindowControls } from '@/components/app/WindowChrome'
+import { ModelPicker } from '@/components/controls/ModelPicker'
 import { ActivityCenter } from '@/components/editor/ActivityCenter'
 import { CanvasCommandBar } from '@/components/editor/CanvasCommandBar'
 import { Inspector } from '@/components/editor/Inspector'
@@ -1364,6 +1365,61 @@ describe('greenfield editor', () => {
     expect(useKoharuStore.getState().preferences?.pipeline.translation).toEqual(
       nextPreferences.pipeline.translation,
     )
+  })
+
+  it('mounts only the visible rows of a large model catalogue', () => {
+    const models = Array.from({ length: 500 }, (_, index) => ({
+      provider: 'openrouter' as const,
+      model: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      quantizations:
+        index === 499
+          ? [
+              { id: 'q4', name: 'Q4_K_M', downloaded: false },
+              { id: 'q8', name: 'Q8_0', downloaded: true },
+            ]
+          : [],
+      vision: false,
+      reasoning: false,
+    }))
+    const onSelect = vi.fn()
+    render(
+      <ModelPicker
+        value={null}
+        models={models}
+        providers={preferences.providers.entries}
+        onBack={() => undefined}
+        onSelect={onSelect}
+      />,
+    )
+
+    const rows = () => screen.getAllByRole('button', { name: /^Use Model \d+ from/ })
+    expect(rows().length).toBeLessThanOrEqual(40)
+
+    // jsdom has no layout and does not clamp scrollTop, so scrolling by the full
+    // list height lands the window on the last rows.
+    const viewport = rows()[0]!.closest<HTMLElement>('[data-slot="scroll-area-viewport"]')!
+    const list = rows()[0]!.parentElement!.parentElement!
+    fireEvent.scroll(viewport, { target: { scrollTop: parseFloat(list.style.height) } })
+    expect(screen.queryByRole('button', { name: /^Use Model 0 from/ })).toBeNull()
+    expect(rows().length).toBeLessThanOrEqual(40)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 498 from/ }))
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ model: 'vendor/model-498', quantization: null }),
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 49' },
+    })
+    expect(screen.getByRole('button', { name: /^Use Model 499 from/ })).toBeInTheDocument()
+    for (const row of rows()) expect(row).toHaveAccessibleName(/^Use Model 49\d? from/)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search models' }), {
+      target: { value: 'Model 499' },
+    })
+    expect(screen.getAllByRole('button', { name: /^Use Model \d+ from/ })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: /^Use Model 499 from/ }))
+    expect(screen.getByRole('button', { name: 'Q4_K_M' })).toHaveFocus()
   })
 
   it('constrains long model names inside the runtime selector', async () => {
