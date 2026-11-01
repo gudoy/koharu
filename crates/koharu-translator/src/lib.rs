@@ -13,10 +13,11 @@ use std::{sync::Arc, time::Duration};
 
 use koharu_ml::Device;
 
-use error::{Error, Result};
+use error::Result;
 use local::LocalTranslator;
 
 pub use backend::{TranslationContext, TranslationRequest};
+pub use error::Error;
 pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
@@ -97,7 +98,8 @@ impl Translator {
     }
 
     /// Translates `request`. Local generation checks `stopped` after every token and a hosted
-    /// request is abandoned once it returns `true`; either way the translation fails as stopped.
+    /// request is abandoned once it returns `true`; either way the translation fails with
+    /// [`Error::Stopped`].
     pub async fn translate(
         &self,
         selection: &ModelSelection,
@@ -185,8 +187,9 @@ impl Translator {
 
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Abandons a hosted request once `stopped` returns `true`. Dropping it is safe because it holds
-/// no accelerator work; local generation must observe the stop itself.
+/// Abandons a hosted request once `stopped` returns `true`. Dropping it only closes the
+/// connection: a server on this machine, such as Ollama or LM Studio, keeps decoding on the same
+/// accelerator until it aborts on the disconnect. Local generation must observe the stop itself.
 async fn unless_stopped<T>(
     request: impl Future<Output = Result<T>>,
     stopped: &impl Fn() -> bool,
