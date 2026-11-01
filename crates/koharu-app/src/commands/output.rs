@@ -171,7 +171,8 @@ fn encode_png(rasterizer: &Rasterizer, frame: &Frame) -> Result<Vec<u8>> {
         .rasterize(&frame.raster_frame()?, RasterOptions::default())?
         .image;
     let mut bytes = Vec::new();
-    PngEncoder::new_with_quality(&mut bytes, CompressionType::Best, FilterType::Adaptive)
+    // `Best` costs about 2.5x the encode time of `Default` for under 2% smaller pages.
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Default, FilterType::Adaptive)
         .write_image(
             image.as_raw(),
             image.width(),

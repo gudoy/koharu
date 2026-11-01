@@ -55,11 +55,18 @@ fn serialize(document: &Document) -> Result<Vec<u8>, PsdExportError> {
     psd.write_u32(layer_mask_info.len() as u32);
     psd.write_bytes(&layer_mask_info);
 
-    let mut merged = document.merged.clone();
     if merged_has_alpha {
+        let mut merged = document.merged.clone();
         apply_photoshop_white_matte(&mut merged);
+        write_image_data(&mut psd, &merged, merged_has_alpha, "Merged Composite")?;
+    } else {
+        write_image_data(
+            &mut psd,
+            &document.merged,
+            merged_has_alpha,
+            "Merged Composite",
+        )?;
     }
-    write_image_data(&mut psd, &merged, merged_has_alpha, "Merged Composite")?;
     Ok(psd.into_inner())
 }
 
