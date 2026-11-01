@@ -558,7 +558,6 @@ impl Project {
             return Ok(commit);
         }
         let commit = self.commit(patch).await?;
-        self.session.persist().await?;
         self.staged = None;
         Ok(commit)
     }

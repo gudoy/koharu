@@ -346,8 +346,21 @@ async fn staged_revisions_publish_only_with_a_commit_or_persist() {
     session.stage(patch).await.unwrap();
     session.persist().await.unwrap();
     drop(session);
-    let session = Session::open(&path).await.unwrap();
+    let mut session = Session::open(&path).await.unwrap();
     assert_eq!(label(&session, page), "persisted");
+
+    let patch = rename(&session, page, "confirmed");
+    session.stage(patch).await.unwrap();
+    let empty = session.snapshot().patch(|_| Ok(())).unwrap();
+    assert!(empty.is_empty());
+    session.commit(empty).await.unwrap();
+    drop(session);
+    let session = Session::open(&path).await.unwrap();
+    assert_eq!(
+        label(&session, page),
+        "confirmed",
+        "an empty commit still publishes a staged revision"
+    );
 }
 
 #[tokio::test]

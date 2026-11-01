@@ -112,6 +112,9 @@ impl Session {
             }));
         }
         if patch.is_empty() {
+            if publish {
+                self.persist().await?;
+            }
             return Ok(Commit {
                 revision: self.current.revision(),
                 changes: Change::empty(self.current.revision()),
