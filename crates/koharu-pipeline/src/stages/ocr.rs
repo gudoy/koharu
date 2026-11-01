@@ -283,7 +283,52 @@ fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use image::DynamicImage;
+    use koharu_scene::{EntityId, Geometry};
+
+    use super::{OcrTarget, infer_text, normalize_ocr_text};
+    use crate::StopToken;
+
+    #[tokio::test]
+    async fn stop_ends_the_region_loop() {
+        let stop = StopToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let targets = (0..3)
+            .map(|_| OcrTarget {
+                content: EntityId::new(),
+                region: EntityId::new(),
+                geometry: Geometry::rectangle(0.0, 0.0, 1.0, 1.0),
+                previous: None,
+                image: DynamicImage::new_luma8(1, 1),
+            })
+            .collect();
+        let inference = {
+            let stop = stop.clone();
+            let calls = calls.clone();
+            move |_: &(), _: &DynamicImage| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                stop.stop();
+                Ok(String::new())
+            }
+        };
+
+        let result = infer_text(Arc::new(Mutex::new(())), targets, stop, inference).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "OCR kept running after stop"
+        );
+        assert!(
+            result.is_err(),
+            "a stopped OCR loop must not return partial text"
+        );
+    }
 
     #[test]
     fn repeated_placeholder_glyphs_are_an_ellipsis() {

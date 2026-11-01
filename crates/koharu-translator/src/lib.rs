@@ -190,7 +190,32 @@ async fn unless_stopped<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    #[tokio::test]
+    async fn stop_abandons_a_hosted_request() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stop.store(true, Ordering::Release);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            unless_stopped(std::future::pending::<Result<()>>(), &|| {
+                stopped.load(Ordering::Acquire)
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a stopped hosted request kept waiting"
+        );
+    }
 
     fn local_selection(model: &str) -> ModelSelection {
         ModelSelection {
