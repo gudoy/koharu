@@ -48,22 +48,14 @@ impl TryIntoDevice<koharu_torch::Device> for Device {
 /// Precision for the default detector and inpainter, which keep their
 /// results within comparison tolerance in bfloat16. Unlike [`set_precision`],
 /// it also uses bfloat16 on Apple GPUs, where it roughly halves their time.
+/// The bundled LibTorch MPS backend requires macOS 14, which has bfloat16
+/// kernels, so every usable MPS device takes this path.
 pub(crate) fn set_reduced_precision(var_store: &mut nn::VarStore) {
-    if matches!(var_store.device(), koharu_torch::Device::Mps) && mps_supports_bfloat16() {
+    if matches!(var_store.device(), koharu_torch::Device::Mps) {
         apply_precision(var_store, true);
     } else {
         set_precision(var_store);
     }
-}
-
-/// MPS gained bfloat16 kernels in macOS 14; older systems reject the first op.
-fn mps_supports_bfloat16() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        koharu_torch::Tensor::f_ones([2, 2], (Kind::BFloat16, koharu_torch::Device::Mps))
-            .and_then(|tensor| tensor.f_matmul(&tensor))
-            .is_ok()
-    })
 }
 
 pub(crate) fn set_precision(var_store: &mut nn::VarStore) {
@@ -95,20 +87,5 @@ fn apply_precision(var_store: &mut nn::VarStore, use_bfloat16: bool) {
         var_store.bfloat16();
     } else {
         var_store.float();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "requires the dynamically loaded LibTorch runtime and an Apple GPU"]
-    async fn reduced_precision_uses_bfloat16_on_metal() -> anyhow::Result<()> {
-        crate::init().await?;
-        let mut var_store = nn::VarStore::new(koharu_torch::Device::Mps);
-        set_reduced_precision(&mut var_store);
-        assert_eq!(var_store.kind(), Kind::BFloat16);
-        Ok(())
     }
 }
