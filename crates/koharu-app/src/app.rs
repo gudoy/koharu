@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use tauri::{AppHandle, Manager as _, WindowEvent};
+use tauri::{AppHandle, Manager as _, RunEvent, WindowEvent};
 use tauri_runtime_cef::{Cef, CefRuntime};
 use tokio::sync::Mutex;
 
@@ -238,8 +238,16 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
                 processing.stops.lock().clear();
                 processing.jobs.lock().clear();
                 window.state::<AgentState>().cancel_all();
-                // Live text-edit drafts are staged in memory until saved.
-                let current = window.state::<CurrentProject>();
+            }
+        })
+        .build(context)?
+        .run(|handle, event| {
+            // Live text-edit drafts are staged in memory until saved. Every exit
+            // path, closing the last window included, requests exit here first;
+            // an application quit tears down without any window event.
+            if let RunEvent::ExitRequested { .. } = event
+                && let Some(current) = handle.try_state::<CurrentProject>()
+            {
                 tauri::async_runtime::block_on(async {
                     if let Some(project) = current.project.lock().await.as_mut()
                         && let Err(error) = project.session.persist().await
@@ -248,7 +256,6 @@ pub fn run(context: tauri::Context<CefRuntime>, batch: Option<Batch>) -> Result<
                     }
                 });
             }
-        })
-        .run(context)?;
+        });
     Ok(())
 }
