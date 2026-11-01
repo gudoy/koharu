@@ -2,8 +2,10 @@
 
 import { Cpu, Gauge, HardDrive, MemoryStick } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useShallow } from 'zustand/react/shallow'
 
 import { useKoharuStore } from '@/lib/store'
+import type { ModelResources } from '@koharu/bridge/protocol'
 import {
   Popover,
   PopoverContent,
@@ -16,20 +18,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@koharu/ui/components/t
 /** Native telemetry for the Koharu process and the accelerator used by models. */
 export function ResourceMonitor() {
   const { t } = useTranslation()
-  const resources = useKoharuStore((state) => state.resources)
-  if (!resources) return null
-
-  const device =
-    resources.devices.find((candidate) => candidate.selected) ?? resources.devices[0] ?? null
-  const cpu = percent(resources.process_cpu)
-  const ram = percentOf(resources.process_memory, resources.system_memory)
-  const ramUsed = bytes(resources.process_memory)
-  const ramTotal = bytes(resources.system_memory)
-  const gpu = device?.utilization == null ? null : percent(device.utilization)
-  const vram =
-    device?.memory_used != null && device.memory_budget != null
-      ? memory(device.memory_used, device.memory_budget)
-      : null
+  // Samples arrive every 100 ms; selecting the formatted values re-renders only
+  // when something on screen changes.
+  const display = useKoharuStore(
+    useShallow((state) => (state.resources ? displayed(state.resources) : null)),
+  )
+  if (!display) return null
+  const { cpu, ram, ramUsed, ramTotal, deviceName, gpu, vram } = display
 
   return (
     <div className='ml-auto shrink-0'>
@@ -85,10 +80,10 @@ export function ResourceMonitor() {
               value={ram}
               detail={t('resources.usedOfTotal', { used: ramUsed, total: ramTotal })}
             />
-            {device && (
+            {deviceName !== null && (
               <ResourceRow
                 icon={HardDrive}
-                label={device.name}
+                label={deviceName}
                 value={gpu ?? '—'}
                 detail={
                   vram ? t('resources.vramValue', { value: vram }) : t('resources.vramUnavailable')
@@ -100,6 +95,23 @@ export function ResourceMonitor() {
       </Popover>
     </div>
   )
+}
+
+function displayed(resources: ModelResources) {
+  const device =
+    resources.devices.find((candidate) => candidate.selected) ?? resources.devices[0] ?? null
+  return {
+    cpu: percent(resources.process_cpu),
+    ram: percentOf(resources.process_memory, resources.system_memory),
+    ramUsed: bytes(resources.process_memory),
+    ramTotal: bytes(resources.system_memory),
+    deviceName: device?.name ?? null,
+    gpu: device?.utilization == null ? null : percent(device.utilization),
+    vram:
+      device?.memory_used != null && device.memory_budget != null
+        ? memory(device.memory_used, device.memory_budget)
+        : null,
+  }
 }
 
 function ResourceRow({
