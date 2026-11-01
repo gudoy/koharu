@@ -770,7 +770,7 @@ impl Project {
         }
         let mut raster_layer = None;
         let mut promote_layer = false;
-        let mut image = if let Some(layer) = layer {
+        let existing = if let Some(layer) = layer {
             if snapshot.parent(layer)? != Some(page) {
                 bail!("the raster target must be a layer on the active page");
             }
@@ -783,24 +783,31 @@ impl Project {
                     .is_some_and(|origin| origin.origin != Origin::User);
             raster_layer = Some(target);
             match snapshot.asset(layer, &AssetRole::new("source")?)? {
-                Some(asset) => {
-                    let bytes = snapshot.read_blob(asset.blob).await?;
-                    image::load_from_memory(&bytes)?.to_rgba8()
-                }
-                None => RgbaImage::new(width, height),
+                Some(asset) => Some(snapshot.read_blob(asset.blob).await?),
+                None => None,
             }
         } else {
             if mode == RasterStrokeMode::Erase {
                 bail!("eraser requires a raster layer target");
             }
-            RgbaImage::new(width, height)
+            None
         };
-        if image.dimensions() != (width, height) {
-            bail!("raster layer dimensions must match the page");
-        }
-        rasterize_stroke(&mut image, mode, color, diameter, &points);
-        let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png)?;
+        // Decoding, painting and encoding a full-page layer takes hundreds of
+        // milliseconds, so it runs off the async workers.
+        let bytes = tokio_rayon::spawn(move || -> Result<Cursor<Vec<u8>>> {
+            let mut image = match existing {
+                Some(bytes) => image::load_from_memory(&bytes)?.to_rgba8(),
+                None => RgbaImage::new(width, height),
+            };
+            if image.dimensions() != (width, height) {
+                bail!("raster layer dimensions must match the page");
+            }
+            rasterize_stroke(&mut image, mode, color, diameter, &points);
+            let mut bytes = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png)?;
+            Ok(bytes)
+        })
+        .await?;
         let source = AssetRole::new("source")?;
         let name = format!(
             "Paint {}",
@@ -1447,6 +1454,60 @@ mod tests {
                 .label,
             "latest manual"
         );
+    }
+
+    #[tokio::test]
+    async fn raster_strokes_commit_a_paint_layer_and_erase_it() {
+        let mut session = Session::memory().await.unwrap();
+        let mut setup = session.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 32.0, 16.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+        let line = vec![
+            ScenePoint { x: 4.0, y: 8.0 },
+            ScenePoint { x: 28.0, y: 8.0 },
+        ];
+
+        let (painted, layer) = project
+            .apply_raster_stroke(
+                page,
+                None,
+                RasterStrokeMode::Paint,
+                [210, 40, 20, 255],
+                5.0,
+                line.clone(),
+            )
+            .await
+            .unwrap();
+        let (erased, erased_layer) = project
+            .apply_raster_stroke(
+                page,
+                Some(layer),
+                RasterStrokeMode::Erase,
+                [0; 4],
+                9.0,
+                line,
+            )
+            .await
+            .unwrap();
+
+        let pixel = |snapshot: &Snapshot| {
+            let blob = snapshot
+                .asset(layer, &AssetRole::new("source").unwrap())
+                .unwrap()
+                .unwrap()
+                .blob;
+            let bytes = futures::executor::block_on(snapshot.read_blob(blob)).unwrap();
+            *image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(16, 8)
+        };
+        assert_eq!(erased_layer, layer);
+        assert_eq!(pixel(&painted.snapshot).0, [210, 40, 20, 255]);
+        assert_eq!(pixel(&erased.snapshot).0[3], 0);
     }
 
     #[test]
