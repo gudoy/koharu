@@ -67,6 +67,7 @@ beforeEach(() => {
 const startupState = (): StartupState => ({
   preferences,
   jobs: [],
+  batch: null,
   canvas: {
     page: null,
     revision: null,

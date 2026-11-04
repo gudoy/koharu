@@ -1,7 +1,7 @@
 'use client'
 
 import { useMutationState } from '@tanstack/react-query'
-import { CircleAlert, Download, LoaderCircle, Square, X } from 'lucide-react'
+import { CircleAlert, Download, Layers, LoaderCircle, Square, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { call } from '@/lib/backend'
@@ -15,6 +15,10 @@ export function ActivityCenter() {
   const { t } = useTranslation()
   const jobs = useKoharuStore((state) => state.jobs)
   const downloads = useKoharuStore((state) => state.downloads)
+  const batch = useKoharuStore((state) => state.batch)
+  const batchOpen = useKoharuStore((state) => state.batchOpen)
+  const setBatchOpen = useKoharuStore((state) => state.setBatchOpen)
+  const showBatch = batch !== null && !batchOpen
   const activities = useMutationState({
     filters: { status: 'pending' },
     select: (mutation) => ({
@@ -32,7 +36,12 @@ export function ActivityCenter() {
   )
   const failedDownloads = Object.values(downloads).filter((download) => download.state === 'failed')
   const visibleDownloads = [...runningDownloads, ...failedDownloads]
-  if (activities.length === 0 && visibleJobs.length === 0 && visibleDownloads.length === 0)
+  if (
+    activities.length === 0 &&
+    visibleJobs.length === 0 &&
+    visibleDownloads.length === 0 &&
+    !showBatch
+  )
     return null
 
   return (
@@ -45,6 +54,24 @@ export function ActivityCenter() {
           {t('activity.title')}
         </span>
       </div>
+      {showBatch && (
+        <button
+          type='button'
+          className='grid grid-cols-[1rem_minmax(0,1fr)_auto] items-center gap-x-2.5 border-b p-3 text-left last:border-b-0 hover:bg-muted/50'
+          onClick={() => setBatchOpen(true)}
+        >
+          <Layers className='size-3.5 justify-self-center text-primary' aria-hidden='true' />
+          <span className='truncate text-[12px] font-medium'>
+            {t('batch.activity', {
+              done: batch.projects.filter((project) => project.state === 'done').length,
+              total: batch.projects.length,
+            })}
+          </span>
+          <span className='text-[10px] text-muted-foreground'>
+            {t(`batch.state.${batch.state}`)}
+          </span>
+        </button>
+      )}
       {activities.map((activity) => (
         <div
           key={activity.id}

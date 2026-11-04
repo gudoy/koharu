@@ -7,6 +7,7 @@ import { useState, type ComponentProps } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { AboutDialog } from '@/components/app/AboutDialog'
+import { BatchDialog } from '@/components/app/BatchDialog'
 import { useMacOS, WindowControls } from '@/components/app/WindowChrome'
 import { call } from '@/lib/backend'
 import { selectableLayer } from '@/lib/geometry'
@@ -57,7 +58,10 @@ export function TitleBar() {
     commands.export,
     'menu.export',
   )
-  const { run: runBatch, busy: batching } = useCommand(['batch'], commands.batch, 'menu.batch')
+  const setBatchOpen = useKoharuStore((state) => state.setBatchOpen)
+  const batching = useKoharuStore(
+    (state) => state.batch !== null && !['finished', 'stopped'].includes(state.batch.state),
+  )
 
   const run = (scope: Scope, operation: Operation = { operation: 'full' }) =>
     void call(commands.process, scope, operation).catch(() => undefined)
@@ -130,7 +134,7 @@ export function TitleBar() {
                   ))}
                 </MenubarSubContent>
               </MenubarSub>
-              <MenubarItem disabled={batching} aria-busy={batching} onClick={() => runBatch()}>
+              <MenubarItem aria-busy={batching} onClick={() => setBatchOpen(true)}>
                 {batching && <LoaderCircle className='animate-spin' aria-hidden='true' />}
                 {t('menu.batch')}
               </MenubarItem>
@@ -287,6 +291,7 @@ export function TitleBar() {
         {!macOS && <WindowControls />}
       </header>
       <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      <BatchDialog />
     </>
   )
 }

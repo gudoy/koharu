@@ -67,7 +67,7 @@ pub(crate) async fn export(
     let Some(destination) = destination.map(|destination| destination.path().to_owned()) else {
         return Ok(());
     };
-    write(&desktop, snapshot, &[format], destination).await?;
+    write(&desktop, snapshot, &[format], destination, &|_| {}).await?;
     Ok(())
 }
 
@@ -78,11 +78,13 @@ const EXPORT_CONCURRENCY: usize = 4;
 
 /// Renders every page of `snapshot` once and writes it to `destination` in
 /// each of `formats`: a folder for PNG and PSD, an archive path for CBZ.
+/// `progress` receives the number of pages written so far after each one.
 pub(crate) async fn write(
     desktop: &Desktop,
     snapshot: Snapshot,
     formats: &[ExportFormat],
     destination: PathBuf,
+    progress: &(dyn Fn(usize) + Send + Sync),
 ) -> Result<()> {
     let pages = snapshot.pages().map(|page| page.id()).collect::<Vec<_>>();
     if pages.is_empty() {
@@ -183,6 +185,7 @@ pub(crate) async fn write(
             }
         }
         index += 1;
+        progress(index);
     }
     if let Some(writer) = archive {
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -357,6 +360,7 @@ mod tests {
             snapshot,
             &crate::commands::batch::FORMATS,
             destination.path().to_owned(),
+            &|_| {},
         )
         .await
         .unwrap();

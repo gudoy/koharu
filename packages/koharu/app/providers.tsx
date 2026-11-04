@@ -19,6 +19,7 @@ import {
   refresh,
 } from '@/lib/queries'
 import {
+  receiveBatch,
   receiveCanvas,
   receiveDownload,
   receiveStartupState,
@@ -28,6 +29,7 @@ import {
 } from '@/lib/store'
 import {
   commands,
+  type BatchState,
   type CanvasState,
   type Download,
   type Job,
@@ -77,6 +79,7 @@ export function Providers({ children }: { children: ReactNode }) {
               queryClient.setQueryData(pageKey, null)
             }
           }),
+          channel<BatchState>(receiveBatch),
         )
         .then((state) => {
           if (lifecycle.active) receiveStartupState(state)
