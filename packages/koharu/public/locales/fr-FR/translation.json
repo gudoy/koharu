@@ -126,7 +126,7 @@
     "remove": "Retirer {{name}}",
     "replace": "Remplacer",
     "resume": "Reprendre",
-    "sameFolder": "La destination doit être hors des dossiers projets.",
+    "sameFolder": "Les exports chevaucheraient un dossier projet. Choisissez une autre destination.",
     "savedTo": "Enregistré dans {{path}}",
     "scanning": "Analyse des dossiers…",
     "selectAll": "Tous",

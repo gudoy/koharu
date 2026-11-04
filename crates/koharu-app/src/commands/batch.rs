@@ -76,8 +76,8 @@ pub struct BatchFolder {
     pub pages: usize,
     pub previous: Option<ReportStatus>,
     pub error: Option<String>,
-    /// Whether the destination already holds this folder's export or the
-    /// report records it as done.
+    /// Whether the folder is already exported to the destination. Its report
+    /// entry decides when it has one, otherwise any export on disk counts.
     pub exists: bool,
 }
 
@@ -97,7 +97,8 @@ pub struct BatchConfig {
     /// names its project and its export.
     pub folders: Vec<String>,
     pub formats: Vec<ExportFormat>,
-    /// Ends the batch at the first failed folder instead of continuing.
+    /// Ends the batch at the first folder with an error, failed pages
+    /// included, instead of continuing.
     pub stop_on_error: bool,
     pub existing: Existing,
 }
@@ -157,6 +158,8 @@ pub struct BatchProject {
     /// Unix time in milliseconds when the running attempt began, so the view
     /// can add the time elapsed since the last update.
     pub since: Option<f64>,
+    /// The export folder, or the archive when only CBZ is exported.
+    pub output: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Type)]
@@ -346,7 +349,11 @@ pub(crate) async fn run(
                 .is_none_or(|entry| !entry.status.exported())
         })
         .map(|(_, path)| path.to_string_lossy().into_owned())
-        .collect();
+        .collect::<Vec<_>>();
+    if folders.is_empty() {
+        tracing::info!(destination = %destination.display(), "batch has nothing left to translate");
+        return Ok(());
+    }
     let config = BatchConfig {
         destination: destination.to_string_lossy().into_owned(),
         folders,
@@ -362,32 +369,7 @@ pub(crate) async fn run(
 /// Validates `config` and publishes the initial batch state. Holding the state
 /// lock across the check keeps two batches from starting together.
 fn begin(handle: &AppHandle<CefRuntime>, config: &BatchConfig) -> Result<()> {
-    let destination = Path::new(&config.destination);
-    if config.folders.is_empty() {
-        bail!("choose at least one folder to translate");
-    }
-    if config.formats.is_empty() {
-        bail!("choose at least one export format");
-    }
-    // A folder's name is its project and export name, so two folders with
-    // the same name would overwrite each other.
-    let mut names = std::collections::HashSet::new();
-    for folder in config.folders.iter().map(Path::new) {
-        if !folder.is_dir() {
-            bail!("{} is not a folder", folder.display());
-        }
-        // Exports would otherwise land inside the folders being imported.
-        if destination.starts_with(folder) {
-            bail!(
-                "the export destination must be outside {}",
-                folder.display()
-            );
-        }
-        let name = folder_name(folder)?;
-        if !names.insert(name.clone()) {
-            bail!("two folders are named {name}");
-        }
-    }
+    validate(config)?;
     if !handle.state::<Processing>().stops.lock().is_empty() {
         bail!("a batch cannot start while processing is running");
     }
@@ -402,6 +384,7 @@ fn begin(handle: &AppHandle<CefRuntime>, config: &BatchConfig) -> Result<()> {
             error: None,
             seconds: 0.0,
             since: None,
+            output: None,
         })
         .collect();
     let control = handle.state::<BatchControl>();
@@ -424,6 +407,49 @@ fn begin(handle: &AppHandle<CefRuntime>, config: &BatchConfig) -> Result<()> {
     };
     control.request.send_replace(BatchRequest::Run);
     handle.state::<BatchChannel>().channel.publish(state);
+    Ok(())
+}
+
+/// Checks the folders and the destination of `config` on disk.
+fn validate(config: &BatchConfig) -> Result<()> {
+    if config.folders.is_empty() {
+        bail!("choose at least one folder to translate");
+    }
+    if config.formats.is_empty() {
+        bail!("choose at least one export format");
+    }
+    // A folder's name is its project and export name, so two folders with
+    // the same name would overwrite each other.
+    let mut names = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    for folder in config.folders.iter().map(Path::new) {
+        if !folder.is_dir() {
+            bail!("{} is not a folder", folder.display());
+        }
+        let name = folder_name(folder)?;
+        if !names.insert(name.clone()) {
+            bail!("two folders are named {name}");
+        }
+        sources.push(
+            fs::canonicalize(folder)
+                .with_context(|| format!("failed to resolve {}", folder.display()))?,
+        );
+    }
+    // Each export replaces `destination/<name>`, so one that overlaps a folder
+    // being imported would write into it or delete it.
+    let destination = resolve(Path::new(&config.destination));
+    for name in &names {
+        let output = destination.join(name);
+        if let Some(source) = sources
+            .iter()
+            .find(|source| output.starts_with(source) || source.starts_with(&output))
+        {
+            bail!(
+                "the export of {name} would overlap the folder {}",
+                source.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -526,6 +552,7 @@ async fn process(handle: &AppHandle<CefRuntime>, config: &BatchConfig) -> Result
             });
             match outcome {
                 Ok(Outcome::Done(pages, failures)) => {
+                    let failed = failures.is_some();
                     let status = if let Some(failures) = &failures {
                         tracing::warn!(project = %name, pages, %failures, "batch project exported with failed pages");
                         ReportStatus::Partial
@@ -546,6 +573,10 @@ async fn process(handle: &AppHandle<CefRuntime>, config: &BatchConfig) -> Result
                         Some(pages),
                         failures,
                     )?;
+                    // Failed pages are errors too. The partial export is kept.
+                    if failed && config.stop_on_error {
+                        return Ok(false);
+                    }
                     break;
                 }
                 // The folder restarts after the pause. Committed stages are
@@ -638,14 +669,38 @@ async fn ask(
     decision
 }
 
-/// Whether `name` already has an export in `destination`, or the report
-/// records it as done.
+/// Whether `name` is already exported to `destination`. A report entry decides
+/// when there is one, because an interrupted export leaves files behind.
+/// Otherwise any export on disk counts.
 fn translated(report: &BTreeMap<String, Entry>, destination: &Path, name: &str) -> bool {
-    report
-        .get(name)
-        .is_some_and(|entry| entry.status.exported())
-        || destination.join(format!("{name}.cbz")).is_file()
-        || fs::read_dir(destination.join(name)).is_ok_and(|mut entries| entries.next().is_some())
+    match report.get(name) {
+        Some(entry) => entry.status.exported(),
+        None => {
+            destination.join(format!("{name}.cbz")).is_file()
+                || fs::read_dir(destination.join(name))
+                    .is_ok_and(|mut entries| entries.next().is_some())
+        }
+    }
+}
+
+/// `path` with links resolved, so two spellings of one location compare
+/// equal. The part that does not exist yet is kept as written.
+fn resolve(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = fs::canonicalize(existing) {
+            return missing
+                .into_iter()
+                .rev()
+                .fold(resolved, |path, part| path.join(part));
+        }
+        let (Some(parent), Some(part)) = (existing.parent(), existing.file_name()) else {
+            return path.to_owned();
+        };
+        missing.push(part);
+        existing = parent;
+    }
 }
 
 /// Deletes the earlier export of `name` so a replacement holds only new files.
@@ -820,15 +875,16 @@ async fn translate(
         .context("no project is open")?
         .snapshot();
     let pages = snapshot.pages().count();
+    let passes = export_passes(formats, destination, name)?;
     set_project(handle, index, |project| {
         project.state = BatchProjectState::Exporting;
         project.pages = pages;
+        project.output = passes
+            .first()
+            .map(|(_, target)| target.to_string_lossy().into_owned());
     });
     let desktop = handle.state::<Desktop>();
-    for (position, (formats, target)) in export_passes(formats, destination, name)?
-        .into_iter()
-        .enumerate()
-    {
+    for (position, (formats, target)) in passes.into_iter().enumerate() {
         let progress = |written: usize| {
             set_project(handle, index, |project| {
                 project.exported = position * pages + written;
@@ -1150,6 +1206,32 @@ mod tests {
             text: Authored::user(text.to_owned()),
             language: language.map(|tag| LanguageTag::new(tag).unwrap()),
         }
+    }
+
+    #[test]
+    fn exports_cannot_overlap_a_project_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let books = root.path().join("books");
+        let chapter = books.join("chapter1");
+        fs::create_dir_all(&chapter).unwrap();
+        let config = |destination: &Path| BatchConfig {
+            destination: destination.to_string_lossy().into_owned(),
+            folders: vec![chapter.to_string_lossy().into_owned()],
+            formats: FORMATS.to_vec(),
+            stop_on_error: false,
+            existing: Existing::Replace,
+        };
+        // Replacing the export of `chapter1` would delete the folder itself.
+        assert!(validate(&config(&books)).is_err());
+        // A destination that does not exist yet still resolves to its location.
+        assert!(validate(&config(&chapter.join("out"))).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&books, &link).unwrap();
+            assert!(validate(&config(&link)).is_err());
+        }
+        validate(&config(&root.path().join("translated"))).unwrap();
     }
 
     #[tokio::test]

@@ -146,15 +146,22 @@ function BatchSetup() {
   const duplicated = (folder: BatchFolder) =>
     selected.has(folder.path) && (nameCounts.get(folder.name) ?? 0) > 1
   const hasDuplicates = chosen.some(duplicated)
-  // Exports inside a project folder would be imported by a later run.
-  const insideProject =
+  // Each export replaces `destination/<name>`, so one that overlaps a project
+  // folder would write into it or delete it. The native check is authoritative.
+  const overlapsProject =
     destination !== null &&
-    chosen.some(
-      (folder) => destination === folder.path || destination.startsWith(`${folder.path}/`),
-    )
+    chosen.some((project) => {
+      const output = `${destination}/${project.name}`
+      return chosen.some(
+        (folder) =>
+          output === folder.path ||
+          output.startsWith(`${folder.path}/`) ||
+          folder.path.startsWith(`${output}/`),
+      )
+    })
   const ready =
     destination !== null &&
-    !insideProject &&
+    !overlapsProject &&
     !hasDuplicates &&
     chosen.length > 0 &&
     chosenFormats.size > 0 &&
@@ -213,10 +220,10 @@ function BatchSetup() {
             <p
               className={cn(
                 'text-[10px]',
-                insideProject ? 'text-destructive' : 'text-muted-foreground',
+                overlapsProject ? 'text-destructive' : 'text-muted-foreground',
               )}
             >
-              {insideProject ? t('batch.sameFolder') : t('batch.destinationHint')}
+              {overlapsProject ? t('batch.sameFolder') : t('batch.destinationHint')}
             </p>
           </Section>
           <Section title={t('batch.formats')}>
@@ -495,7 +502,6 @@ function BatchProgress({ batch }: { batch: BatchState }) {
             project={project}
             job={project.state === 'processing' ? job : undefined}
             exports={batch.exports}
-            destination={batch.destination}
           />
         ))}
       </ul>
@@ -600,14 +606,13 @@ function ProjectRow({
   project,
   job,
   exports,
-  destination,
 }: {
   project: BatchProject
   job: Job | undefined
   exports: number
-  destination: string
 }) {
   const { t } = useTranslation()
+  const output = project.output
   const progress = Math.round(projectFraction(project, job, exports) * 100)
   const detail =
     project.state === 'processing'
@@ -639,14 +644,12 @@ function ProjectRow({
         >
           {t(`batch.projectState.${project.state}`)}
         </span>
-        {project.state === 'done' && (
+        {project.state === 'done' && output !== null && (
           <Button
             size='icon-xs'
             variant='ghost'
             aria-label={t('batch.openProject')}
-            onClick={() =>
-              void revealItemsInDir(`${destination}/${project.name}`).catch(() => undefined)
-            }
+            onClick={() => void revealItemsInDir(output).catch(() => undefined)}
           >
             <FolderOpen />
           </Button>
@@ -769,7 +772,6 @@ function projectFraction(project: BatchProject, job: Job | undefined, exports: n
     case 'processing':
       return job && job.total > 0 ? (job.completed / job.total) * PROCESSING_SHARE : 0
     case 'exporting': {
-      // Each export pass writes every page once.
       const total = project.pages * exports
       return (
         PROCESSING_SHARE + (total > 0 ? (project.exported / total) * (1 - PROCESSING_SHARE) : 0)
@@ -826,7 +828,6 @@ function writeRate(rate: number) {
   }
 }
 
-/** Current time, refreshed every second while `active`. */
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {

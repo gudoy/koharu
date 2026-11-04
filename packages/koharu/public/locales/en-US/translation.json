@@ -126,7 +126,7 @@
     "remove": "Remove {{name}}",
     "replace": "Replace",
     "resume": "Resume",
-    "sameFolder": "The destination must be outside the project folders.",
+    "sameFolder": "Exports would overlap a project folder. Choose another destination.",
     "savedTo": "Saved to {{path}}",
     "scanning": "Scanning folders…",
     "selectAll": "All",

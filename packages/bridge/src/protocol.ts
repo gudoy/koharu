@@ -98,7 +98,10 @@ export type BatchConfig = {
 	 */
 	folders: string[],
 	formats: ExportFormat[],
-	/**  Ends the batch at the first failed folder instead of continuing. */
+	/**
+	 *  Ends the batch at the first folder with an error, failed pages
+	 *  included, instead of continuing.
+	 */
 	stop_on_error: boolean,
 	existing: Existing,
 };
@@ -111,8 +114,8 @@ export type BatchFolder = {
 	previous: ReportStatus | null,
 	error: string | null,
 	/**
-	 *  Whether the destination already holds this folder's export or the
-	 *  report records it as done.
+	 *  Whether the folder is already exported to the destination. Its report
+	 *  entry decides when it has one, otherwise any export on disk counts.
 	 */
 	exists: boolean,
 };
@@ -131,6 +134,8 @@ export type BatchProject = {
 	 *  can add the time elapsed since the last update.
 	 */
 	since: number | null,
+	/**  The export folder, or the archive when only CBZ is exported. */
+	output: string | null,
 };
 
 export type BatchProjectState = "pending" | "processing" | "exporting" | "done" | "skipped" | "failed" | "stopped";
