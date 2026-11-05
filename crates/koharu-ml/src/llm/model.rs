@@ -38,6 +38,9 @@ const DEFAULT_MAX_UBATCH: u32 = 512;
 const CONTEXT_STEP: u32 = 1024;
 const BATCH_STEP: u32 = 512;
 const CHAT_TEMPLATE_NAME: &str = "chat";
+/// llama.cpp's default DRY sequence breakers. A repeat stops at them, so the
+/// keys and quotes every JSON entry repeats are not penalized.
+const DRY_SEQUENCE_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
 
 pub(super) struct Model {
     backend: &'static LlamaBackend,
@@ -519,17 +522,7 @@ impl Model {
         let mut samplers = Vec::new();
 
         if let Some(schema) = json_schema {
-            let mut schema = schema.clone();
-            if let Some(schema) = schema.as_object_mut() {
-                schema.entry("x-guidance").or_insert_with(|| {
-                    serde_json::json!({
-                        "item_separator": ", ",
-                        "key_separator": ": ",
-                        "whitespace_flexible": false
-                    })
-                });
-            }
-            let schema = serde_json::to_string(&schema)
+            let schema = serde_json::to_string(&with_guidance_options(schema))
                 .context("failed to serialize structured output schema")?;
             let factory = self
                 .llguidance_factory
@@ -567,6 +560,19 @@ impl Model {
             penalties.accept_many(history_tokens);
             samplers.push(penalties);
         }
+        // DRY sees only the generated tokens, unlike the repeat penalty above:
+        // reusing a prompt's wording, such as a name from the context, is not
+        // a loop.
+        if let Some(dry) = options.dry {
+            samplers.push(LlamaSampler::dry(
+                &self.model,
+                dry.multiplier,
+                dry.base,
+                dry.allowed_length,
+                dry.penalty_last_n,
+                DRY_SEQUENCE_BREAKERS,
+            ));
+        }
 
         if options.temperature <= 0.0 {
             samplers.push(LlamaSampler::greedy());
@@ -591,6 +597,28 @@ impl Model {
     fn should_stop(&self, token: LlamaToken) -> bool {
         token == self.eos_token || self.model.is_eog_token(token)
     }
+}
+
+/// Adds llguidance's JSON options to `schema` unless it brings its own.
+///
+/// By default llguidance accepts a `\uXXXX` escape only for a control
+/// character. A model that escapes a symbol such as `∞` as `\u221e` is then
+/// forced from `\u00` into a control character, and can loop on them until the
+/// token limit cuts its JSON. Allowing every Unicode scalar escape keeps the
+/// character the model meant. A `pattern` on a string turns this option off.
+fn with_guidance_options(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = schema.clone();
+    if let Some(schema) = schema.as_object_mut() {
+        schema.entry("x-guidance").or_insert_with(|| {
+            serde_json::json!({
+                "item_separator": ", ",
+                "key_separator": ": ",
+                "whitespace_flexible": false,
+                "json_allow_general_unicode_escapes": true
+            })
+        });
+    }
+    schema
 }
 
 struct PreparedPrompt {
@@ -821,6 +849,24 @@ fn validate_generation_options(options: &GenerationOptions) -> Result<()> {
         options.repeat_last_n >= 0,
         "repeat_last_n must be non-negative"
     );
+    if let Some(dry) = options.dry {
+        ensure!(
+            dry.multiplier.is_finite() && dry.multiplier >= 0.0,
+            "DRY multiplier must be finite and non-negative"
+        );
+        ensure!(
+            dry.base.is_finite() && dry.base >= 1.0,
+            "DRY base must be finite and at least 1"
+        );
+        ensure!(
+            dry.allowed_length >= 0,
+            "DRY allowed length must be non-negative"
+        );
+        ensure!(
+            dry.penalty_last_n > 0,
+            "DRY penalty window must be positive"
+        );
+    }
     if let Some(n_threads) = options.n_threads {
         ensure!(n_threads > 0, "n_threads must be positive");
     }
@@ -895,6 +941,42 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
+
+    /// Counts the leading bytes of `response` that `schema`, with the guidance
+    /// options inference adds, accepts.
+    fn accepted_bytes(schema: &serde_json::Value, response: &str) -> usize {
+        let env = llguidance::toktrie::ApproximateTokEnv::single_byte_env();
+        let factory = ParserFactory::new_simple(&env).unwrap();
+        let schema = with_guidance_options(schema).to_string();
+        let grammar = TopLevelGrammar::from_tagged_str("json_schema", &schema).unwrap();
+        let mut matcher = Matcher::new(Ok(factory.create_parser(grammar).unwrap()));
+        matcher
+            .validate_tokens(&env.tokenize_bytes(response.as_bytes()))
+            .unwrap()
+    }
+
+    #[test]
+    fn structured_output_accepts_escaped_symbols() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+            "additionalProperties": false
+        });
+        for response in [
+            r#"{"text": "\u221e and \u00e9"}"#,
+            r#"{"text": "\ud83d\ude00"}"#,
+            r#"{"text": "∞ é\n"}"#,
+        ] {
+            assert_eq!(
+                accepted_bytes(&schema, response),
+                response.len(),
+                "{response}"
+            );
+        }
+        let unpaired = r#"{"text": "\ud83d"}"#;
+        assert!(accepted_bytes(&schema, unpaired) < unpaired.len());
+    }
 
     #[test]
     fn chat_template_preserves_messages_and_options() {
