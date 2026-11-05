@@ -184,9 +184,9 @@ function BatchSetup() {
   return (
     <>
       <div className='grid min-h-0 flex-1 gap-4 sm:grid-cols-[minmax(0,17rem)_minmax(0,1fr)]'>
-        <div className='grid content-start gap-4'>
+        <div className='grid grid-cols-1 content-start gap-4'>
           <Section title={t('batch.source')}>
-            <div className='grid gap-2'>
+            <div className='grid grid-cols-1 gap-2'>
               <Button
                 size='sm'
                 variant='outline'
@@ -195,7 +195,7 @@ function BatchSetup() {
                 onClick={() => void add(false)}
               >
                 <FolderPlus aria-hidden='true' />
-                {t('batch.addProjects')}
+                <span className='truncate'>{t('batch.addProjects')}</span>
               </Button>
               <Button
                 size='sm'
@@ -205,7 +205,7 @@ function BatchSetup() {
                 onClick={() => void add(true)}
               >
                 <FolderTree aria-hidden='true' />
-                {t('batch.addParent')}
+                <span className='truncate'>{t('batch.addParent')}</span>
               </Button>
             </div>
             <p className='text-[10px] text-muted-foreground'>{t('batch.sourceHint')}</p>
@@ -696,8 +696,10 @@ function toggle<T>(set: Set<T>, value: T, checked: boolean): Set<T> {
   return next
 }
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  // `grid-cols-1` lets the column shrink below its content, so a long path
+  // truncates instead of widening the column under the project list.
   return (
-    <section className='grid gap-2'>
+    <section className='grid grid-cols-1 gap-2'>
       <h3 className='text-[10px] font-semibold tracking-[0.1em] text-muted-foreground uppercase'>
         {title}
       </h3>
