@@ -184,7 +184,10 @@ function BatchSetup() {
   return (
     <>
       <div className='grid min-h-0 flex-1 gap-4 sm:grid-cols-[minmax(0,17rem)_minmax(0,1fr)]'>
-        <div className='grid grid-cols-1 content-start gap-4'>
+        {/* Scrolls when the dialog is short. The padding keeps focus rings and
+            the radio hit area inside the scroll area; the negative margin
+            cancels it. */}
+        <div className='-m-1 grid min-h-0 grid-cols-1 content-start gap-4 overflow-y-auto p-1 pb-2'>
           <Section title={t('batch.source')}>
             <div className='grid grid-cols-1 gap-2'>
               <Button
