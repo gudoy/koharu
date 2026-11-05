@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use koharu_ml::llm::{
-    ChatMessage, ChatTemplateOptions, FinishReason, GenerationControl, Input, Llm, LoadOptions,
-    MtmdOptions, media_marker,
+    ChatMessage, ChatTemplateOptions, FinishReason, Generation, GenerationControl, Input, Llm,
+    LoadOptions, MtmdOptions, media_marker,
 };
 
 mod catalog;
@@ -87,6 +87,7 @@ impl LocalTranslator {
         if !explicit_limit {
             generation.max_tokens = generation.max_tokens.max(output_budget(&request.segments));
         }
+        let max_tokens = generation.max_tokens;
         let output = tokio_rayon::spawn(move || {
             let input = image.as_deref().map_or_else(
                 || Input::new(&prompt),
@@ -104,8 +105,7 @@ impl LocalTranslator {
         if output.finish_reason == FinishReason::Callback {
             return Err(Error::Stopped);
         }
-        let segments = prompt::translations("local", &output.text, &request.segments)?;
-        Ok(segments)
+        Ok(translations(&output, max_tokens, &request.segments)?)
     }
 
     fn render_prompt(&self, request: &TranslationRequest, reasoning: bool) -> Result<String> {
@@ -126,6 +126,24 @@ impl LocalTranslator {
             )
             .context("failed to render local translation prompt")?)
     }
+}
+
+/// Parses the model response. A response cut at the token limit is invalid
+/// JSON, and the error says so instead of only reporting where parsing ended.
+fn translations(
+    output: &Generation,
+    max_tokens: usize,
+    segments: &[String],
+) -> anyhow::Result<Vec<String>> {
+    prompt::translations("local", &output.text, segments).map_err(|error| {
+        if output.finish_reason == FinishReason::Length {
+            error.context(format!(
+                "local output stopped at its {max_tokens}-token limit"
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 /// Output tokens the schema's JSON object around one translated segment costs.

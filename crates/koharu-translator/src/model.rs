@@ -1,4 +1,4 @@
-use koharu_ml::llm::GenerationOptions;
+use koharu_ml::llm::{DryOptions, GenerationOptions};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -157,10 +157,24 @@ impl ModelGeneration {
                 .presence_penalty
                 .or(self.presence_penalty)
                 .unwrap_or(defaults.presence_penalty),
+            dry: Some(LOOP_PENALTY),
             ..defaults
         }
     }
 }
+
+/// A local model can loop on a syllable ("cher-cher-cher…") until the token
+/// limit cuts its JSON. The multiplier and base are the values the DRY author
+/// recommends. The recommended allowed length of 2 changed correct pages: it
+/// broke rows of repeated symbols and gave two identical bubbles different
+/// translations. At 10, a loop still ends after a few repeats. The window spans
+/// a few segments, so a phrase repeated in distant bubbles is not penalized.
+const LOOP_PENALTY: DryOptions = DryOptions {
+    multiplier: 0.8,
+    base: 1.75,
+    allowed_length: 10,
+    penalty_last_n: 256,
+};
 
 #[must_use]
 pub(crate) fn display_name(model: &str) -> String {
