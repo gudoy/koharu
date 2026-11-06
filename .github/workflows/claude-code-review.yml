@@ -1,0 +1,38 @@
+name: Claude Code Review
+
+on:
+  # Not `synchronize`: saves subscription quota. Ask for a re-review with `@claude`.
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review
+    # Temporary author filter: remove or widen it to review every PR.
+    if: github.event.pull_request.user.login == 'gudoy' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use GITHUB_TOKEN, not the Claude GitHub App: the App's OIDC token
+          # exchange refuses workflow files that differ from the default branch.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          plugin_marketplaces: https://github.com/anthropics/claude-plugins-official.git
+          plugins: code-review@claude-plugins-official
+          prompt: >-
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment
+            Treat AGENTS.md files as the CLAUDE.md files for the compliance checks.
