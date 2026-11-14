@@ -257,6 +257,9 @@ pub struct GenerationOptions {
     pub repeat_last_n: i32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
+    /// Penalty for extending a token sequence the generation already produced;
+    /// `None` disables it.
+    pub dry: Option<DryOptions>,
     /// Whether llama.cpp or MTMD should add the model's special prompt tokens.
     pub add_special: bool,
     pub n_ctx: Option<NonZeroU32>,
@@ -279,6 +282,7 @@ impl Default for GenerationOptions {
             repeat_last_n: 64,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            dry: None,
             add_special: false,
             n_ctx: None,
             n_batch: None,
@@ -287,6 +291,22 @@ impl Default for GenerationOptions {
             n_threads_batch: None,
         }
     }
+}
+
+/// llama.cpp's DRY ("don't repeat yourself") sampler settings.
+///
+/// A repeat penalty lowers every recent token by the same factor, which a
+/// model stuck in a loop outweighs. DRY instead penalizes the token that would
+/// extend a sequence already generated, by `multiplier * base^(length -
+/// allowed_length)`, so the penalty grows with the length of the repetition.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DryOptions {
+    pub multiplier: f32,
+    pub base: f32,
+    /// Longest repeated sequence left unpenalized, in tokens.
+    pub allowed_length: i32,
+    /// Number of recent tokens searched for repeats.
+    pub penalty_last_n: i32,
 }
 
 /// Text and accounting information produced by one inference call.
